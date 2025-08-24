@@ -415,7 +415,7 @@ async function loadGraph() {
         { selector: 'node',
           style: {
             'shape': 'round-rectangle',
-            'background-color': '#111827',
+            'background-color': 'data(cls_color)',
             'border-color': '#e5e7eb',
             'border-width': 1,
             'color': '#fff',
@@ -454,6 +454,7 @@ async function loadGraph() {
     cy.on('tap', 'node', onNodeTap);
     setupCyDnD();
     setupRightDrag();
+    applyClassColors();
   } else {
     const verticalSpacing = 140;
     cy.elements().remove();
@@ -466,6 +467,8 @@ async function loadGraph() {
       }
     }).run();
   }
+  // Ensure class colors applied on (re)load
+  applyClassColors();
   // Re-add staged edges as green overlays
   renderStagedEdges();
   statusEl.textContent = '';
@@ -657,6 +660,33 @@ function hasDnDData(e){
 }
 function getDnDData(e){
   try { return JSON.parse(e.dataTransfer.getData('application/json')); } catch { return null; }
+}
+
+// ---- Class color mapping (unique per class) ----
+function buildUniqueClassPalette(){
+  if (!cy) return {};
+  const classes = [];
+  cy.nodes().forEach(n => { const c = n.data('cls'); if (c) classes.push(c); });
+  const uniq = Array.from(new Set(classes));
+  const palette = {};
+  // Golden-angle hue stepping for well-distributed unique hues
+  for (let i = 0; i < uniq.length; i++) {
+    const hue = (i * 137.508) % 360; // keep decimal to avoid collisions
+    // Vary saturation/lightness a bit over cycles to keep contrast with many classes
+    const sat = 65 + ((i % 3) * 7); // 65,72,79
+    const light = 35 + (Math.floor(i / 3) % 2) * 8; // 35,43,35,43...
+    palette[uniq[i]] = `hsl(${hue}, ${sat}%, ${light}%)`;
+  }
+  return palette;
+}
+function applyClassColors(){
+  if (!cy) return;
+  const palette = buildUniqueClassPalette();
+  cy.nodes().forEach(n => {
+    const cls = n.data('cls');
+    const color = cls ? (palette[cls] || '#374151') : '#374151';
+    n.data('cls_color', color);
+  });
 }
 
 outputsBtn.addEventListener('click', () => {
