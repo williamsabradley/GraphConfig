@@ -2,15 +2,24 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from io import StringIO
 
 from flask import Flask, jsonify, request, Response
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
+try:
+    from jinja2 import Environment, FileSystemLoader, StrictUndefined
+except Exception:
+    Environment = None  # type: ignore
+    FileSystemLoader = None  # type: ignore
+    StrictUndefined = None  # type: ignore
+
 app = Flask(__name__)
 
 # === Configuration ===
 CONFIG_PATH = os.environ.get("ROCKIQ_CONFIG", "config.yml")
+LIBRARY_DIR = os.environ.get("ROCKIQ_LIBRARY", "library")
 
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -18,12 +27,37 @@ yaml.width = 4096  # avoid line wraps for long inline structures
 
 # ---------- YAML helpers ----------
 
+def render_jinja_text(raw_text: str, base_dir: Path) -> str:
+    """
+    Render Jinja templates in YAML text using environment variables and basic context.
+    If jinja2 is unavailable or rendering fails, return raw_text unchanged.
+    Available variables:
+      - env: environment variables (dict)
+      - file_dir: directory of the YAML file
+      - cwd: current working directory
+    """
+    if Environment is None:
+        return raw_text
+    try:
+        env = Environment(loader=FileSystemLoader(str(base_dir)), undefined=StrictUndefined, autoescape=False)
+        template = env.from_string(raw_text)
+        context = {
+            "env": dict(os.environ),
+            "file_dir": str(base_dir),
+            "cwd": str(Path.cwd()),
+        }
+        return template.render(**context)
+    except Exception:
+        # Best-effort fallback preserves original file if rendering fails
+        return raw_text
+
 def load_all_docs(path: str) -> List[CommentedMap]:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"Config file not found: {p.resolve()}")
-    with p.open("r", encoding="utf-8") as f:
-        docs = list(yaml.load_all(f))
+    text = p.read_text(encoding="utf-8")
+    rendered = render_jinja_text(text, p.parent)
+    docs = list(yaml.load_all(StringIO(rendered)))
     return docs
 
 def save_all_docs(path: str, docs: List[CommentedMap]) -> None:
@@ -90,6 +124,8 @@ def build_graph_from_sequence(sequence: dict) -> dict:
                 "func": func,
                 "full": full,
                 "params": params,
+                "w": 190,
+                "h": 48,
             }
         })
         func_to_indices.setdefault(func, []).append(i)
@@ -437,7 +473,6 @@ async function loadGraph() {
       motionBlurOpacity: 0.2,
       hideEdgesOnViewport: true,
       hideLabelsOnViewport: true,
-      wheelSensitivity: 0.2,
       layout: {
         name: 'preset',
         positions: function(node){
@@ -456,11 +491,11 @@ async function loadGraph() {
             'label': 'data(label)',
             'text-valign': 'center',
             'text-wrap': 'wrap',
-            'text-max-width': '180px',
-            'font-size': 12,
-            'padding': '10px',
-            'width': 'label',
-            'height': 'label'
+            'text-max-width': '160px',
+            'font-size': 11,
+            'padding': '6px',
+            'width': 'data(w)',
+            'height': 'data(h)'
           }
         },
         { selector: 'node[cls_color]', style: { 'background-color': 'data(cls_color)' } },
@@ -491,6 +526,8 @@ async function loadGraph() {
     setupCyDnD();
     setupRightDrag();
     applyClassColors();
+    // build from server library first; fallback to CY
+    await fetchLibrary();
     buildLibraryFromCy();
   } else {
     const verticalSpacing = VERTICAL_SPACING;
@@ -508,6 +545,7 @@ async function loadGraph() {
     } catch (e) {
       cy.layout({ name: 'grid', rows: Math.ceil(Math.sqrt(g.nodes.length || 1)) }).run();
     }
+    await fetchLibrary();
     buildLibraryFromCy();
   }
   // Ensure class colors applied on (re)load
@@ -836,7 +874,9 @@ function renderStagedAdds(){
       full: a.full,
       params: a.params,
       staged: true,
-      outputs: a.outputs || []
+      outputs: a.outputs || [],
+      w: 190,
+      h: 48
     }
   }));
   if (toAdd.length) {
@@ -1069,9 +1109,39 @@ function endRightDrag(){
 }
 
 // ---- Library ----
+async function fetchLibrary(){
+  try {
+    const res = await fetch('/library', { cache: 'no-store' });
+    if (!res.ok) return;
+    const payload = await res.json();
+    if (payload && payload.classes) {
+      // merge server library into current library map, avoid dups by func
+      const map = library.classToModules || {};
+      Object.keys(payload.classes).forEach(cls => {
+        map[cls] = map[cls] || [];
+        const existingFuncs = new Set(map[cls].map(m => m.func));
+        payload.classes[cls].forEach(m => {
+          if (!existingFuncs.has(m.func)) map[cls].push(m);
+        });
+      });
+      library.classToModules = map;
+      // refresh UI
+      if (libClassSelect) {
+        const current = libClassSelect.value;
+        libClassSelect.innerHTML = '<option value="">Select class…</option>';
+        Object.keys(map).sort().forEach(c => {
+          const opt = document.createElement('option'); opt.value = c; opt.textContent = c; libClassSelect.appendChild(opt);
+        });
+        if (current && map[current]) libClassSelect.value = current;
+        renderLibraryModules();
+      }
+    }
+  } catch (e) {}
+}
+
 function buildLibraryFromCy(){
   if (!cy) return;
-  const map = {};
+  const merged = library.classToModules ? JSON.parse(JSON.stringify(library.classToModules)) : {};
   cy.nodes().forEach(n => {
     if (n.data('staged')) return;
     const cls = n.data('cls') || '';
@@ -1080,20 +1150,20 @@ function buildLibraryFromCy(){
     const params = n.data('params') || {};
     const outputs = n.data('outputs') || [];
     if (!cls || !func) return;
-    map[cls] = map[cls] || [];
-    if (!map[cls].some(m => m.func === func)) {
-      map[cls].push({ func, full, params, outputs });
+    merged[cls] = merged[cls] || [];
+    if (!merged[cls].some(m => m.func === func)) {
+      merged[cls].push({ func, full, params, outputs });
     }
   });
-  library.classToModules = map;
+  library.classToModules = merged;
   // populate class select
-  if (typeof libClassSelect === 'undefined') return;
+  if (typeof libClassSelect === 'undefined' || !libClassSelect) return;
   const current = libClassSelect.value;
   libClassSelect.innerHTML = '<option value="">Select class…</option>';
-  Object.keys(map).sort().forEach(c => {
+  Object.keys(merged).sort().forEach(c => {
     const opt = document.createElement('option'); opt.value = c; opt.textContent = c; libClassSelect.appendChild(opt);
   });
-  if (current && map[current]) libClassSelect.value = current; else libClassSelect.value = '';
+  if (current && merged[current]) libClassSelect.value = current; else libClassSelect.value = '';
   renderLibraryModules();
 }
 
@@ -1193,6 +1263,69 @@ def sequences():
         "config_path": str(Path(CONFIG_PATH).resolve()),
         "sequences": out
     })
+
+@app.get("/library")
+def get_library():
+    """
+    Load library modules from ./library directory:
+    - Accept multiple .yml/.yaml files
+    - Aggregate across all sequences in those files
+    Group by class and expose func/full/params/outputs.
+    """
+    lib_dir = Path(LIBRARY_DIR)
+    classes: Dict[str, List[dict]] = {}
+    if lib_dir.exists() and lib_dir.is_dir():
+        yaml_files = sorted(list(lib_dir.glob("*.yml")) + list(lib_dir.glob("*.yaml")))
+        for yf in yaml_files:
+            try:
+                raw = yf.read_text(encoding="utf-8")
+                rendered = render_jinja_text(raw, yf.parent)
+                docs = list(yaml.load_all(StringIO(rendered)))
+            except Exception:
+                continue
+            # find sequences across all docs and build outputs by function
+            outputs_by_func: Dict[str, set] = {}
+            seq_modules_by_seq: List[List[dict]] = []
+            for d in docs:
+                if not isinstance(d, dict):
+                    continue
+                if d.get("section") == "SequenceConfig":
+                    seqs = d.get("sequences") or []
+                    for s in seqs:
+                        modules = s.get("module_sequence") or []
+                        seq_modules_by_seq.append(modules)
+                        # scan refs for outputs
+                        for mod in modules:
+                            for k, v in (mod.items() if isinstance(mod, dict) else []):
+                                if isinstance(k, str) and k.startswith("ref_") and isinstance(v, dict):
+                                    ref_mod = v.get("module")
+                                    name = v.get("name")
+                                    if ref_mod and name:
+                                        # last token after '.'
+                                        func = ref_mod.split(".")[-1]
+                                        outputs_by_func.setdefault(func, set()).add(str(name))
+            # now create class entries
+            for modules in seq_modules_by_seq:
+                for mod in modules:
+                    if not isinstance(mod, dict):
+                        continue
+                    full = mod.get("module", "")
+                    if not full:
+                        continue
+                    cls, func = parse_module_class_func(full)
+                    params = {k: v for k, v in mod.items() if k != "module"}
+                    exp_outs = mod.get("outputs", {})
+                    outs = set()
+                    if isinstance(exp_outs, dict):
+                        outs.update(list(exp_outs.keys()))
+                    outs.update(outputs_by_func.get(func, set()))
+                    entry = {"func": func, "full": full, "params": params, "outputs": sorted(list(outs))}
+                    if cls:
+                        classes.setdefault(cls, [])
+                        if not any(e.get("func") == func for e in classes[cls]):
+                            classes[cls].append(entry)
+
+    return jsonify({"classes": classes, "dir": str(lib_dir.resolve())})
 
 @app.get("/graph")
 def graph():
