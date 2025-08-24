@@ -15,11 +15,81 @@ except Exception:
     FileSystemLoader = None  # type: ignore
     StrictUndefined = None  # type: ignore
 
+# Optional: native file dialogs for local use
+try:
+    import tkinter as _tk
+    from tkinter import filedialog as _filedialog
+except Exception:
+    _tk = None  # type: ignore
+    _filedialog = None  # type: ignore
+
 app = Flask(__name__)
 
 # === Configuration ===
 CONFIG_PATH = os.environ.get("ROCKIQ_CONFIG", "config.yml")
 LIBRARY_DIR = os.environ.get("ROCKIQ_LIBRARY", "library")
+
+# Mutable current config path, switchable at runtime via API
+CURRENT_CONFIG_PATH = CONFIG_PATH
+
+def get_config_path() -> str:
+    return CURRENT_CONFIG_PATH
+
+def set_config_path(path: str) -> None:
+    global CURRENT_CONFIG_PATH
+    CURRENT_CONFIG_PATH = path
+
+def _open_file_dialog(initial_dir: str = "", title: str = "Open file") -> str:
+    """
+    Show a native open-file dialog on the server host and return the selected path or '' if cancelled.
+    Safe fallback to '' if tkinter is unavailable.
+    """
+    if _tk is None or _filedialog is None:
+        return ""
+    try:
+        root = _tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        path = _filedialog.askopenfilename(
+            title=title,
+            initialdir=initial_dir or str(Path.cwd()),
+            filetypes=[("YAML files", "*.yml *.yaml"), ("All files", "*.*")]
+        )
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return path or ""
+    except Exception:
+        return ""
+
+def _save_file_dialog(initial_dir: str = "", initial_file: str = "config.yml", title: str = "Save As") -> str:
+    if _tk is None or _filedialog is None:
+        return ""
+    try:
+        root = _tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+        except Exception:
+            pass
+        path = _filedialog.asksaveasfilename(
+            title=title,
+            initialdir=initial_dir or str(Path.cwd()),
+            initialfile=initial_file,
+            defaultextension=".yml",
+            filetypes=[("YAML files", "*.yml *.yaml"), ("All files", "*.*")]
+        )
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return path or ""
+    except Exception:
+        return ""
 
 yaml = YAML()
 yaml.preserve_quotes = True
@@ -322,6 +392,8 @@ def index() -> Response:
         </select>
       </label>
       <button id="refreshBtn" class="pill primary">Refresh</button>
+      <button id="openBtn" class="pill">Open…</button>
+      <button id="saveAsBtn" class="pill">Save As…</button>
       <span id="status" class="muted"></span>
     </header>
     <div id="cy"></div>
@@ -332,6 +404,7 @@ def index() -> Response:
     <div class="row" style="margin:0;">
       <button id="discardStagedBtn" class="pill">Discard</button>
       <button id="applyStagedBtn" class="pill primary">Save Changes</button>
+      <button id="saveBarSaveAsBtn" class="pill">Save As…</button>
     </div>
   </div>
 
@@ -352,8 +425,10 @@ def index() -> Response:
       <div class="grid" id="formGrid"></div>
       <div class="row">
         <button id="outputsBtn" class="pill">Outputs</button>
+        <button id="deleteBtn" class="pill danger">Delete</button>
         <button id="closeBtn" class="pill">Close</button>
         <button id="saveBtn" class="pill primary">Save</button>
+        <button id="saveAsBtnModal" class="pill">Save As…</button>
       </div>
       <div id="outputsPanel" style="display:none; margin-top:10px; border-top:1px solid #e5e7eb; padding-top:10px;">
         <div class="muted" style="margin-bottom:6px;">Drag an output from this node onto another node in the graph to link it, or onto a ref_* field below.</div>
@@ -387,6 +462,8 @@ def index() -> Response:
 const cfgNameEl = document.getElementById('cfgName');
 const seqSelect = document.getElementById('sequenceSelect');
 const refreshBtn = document.getElementById('refreshBtn');
+const openBtn = document.getElementById('openBtn');
+const saveAsBtn = document.getElementById('saveAsBtn');
 const statusEl = document.getElementById('status');
 
 const modalBackdrop = document.getElementById('modalBackdrop');
@@ -396,6 +473,8 @@ const formGrid = document.getElementById('formGrid');
 const closeBtn = document.getElementById('closeBtn');
 const saveBtn = document.getElementById('saveBtn');
 const outputsBtn = document.getElementById('outputsBtn');
+const deleteBtn = document.getElementById('deleteBtn');
+const saveAsBtnModal = document.getElementById('saveAsBtnModal');
 const outputsPanel = document.getElementById('outputsPanel');
 const outputsList = document.getElementById('outputsList');
 const linkerBackdrop = document.getElementById('linkerBackdrop');
@@ -408,6 +487,7 @@ const saveBar = document.getElementById('saveBar');
 const saveMsg = document.getElementById('saveMsg');
 const applyStagedBtn = document.getElementById('applyStagedBtn');
 const discardStagedBtn = document.getElementById('discardStagedBtn');
+const saveBarSaveAsBtn = document.getElementById('saveBarSaveAsBtn');
 const libPanel = document.getElementById('libPanel');
 const libClassSelect = document.getElementById('libClassSelect');
 const libBody = document.getElementById('libBody');
@@ -443,6 +523,29 @@ async function loadSequences() {
   if (payload.sequences.length > 0) {
     seqSelect.value = currentSeqId;
   }
+}
+async function chooseFileAndSetConfig(){
+  try {
+    const res = await fetch('/dialog/open_config', { method: 'POST' });
+    if (!res.ok) { alert('Open failed: ' + await res.text()); return; }
+    const payload = await res.json();
+    if (!payload.ok) return; // cancelled
+    cfgNameEl.textContent = payload.config_path;
+    await loadSequences();
+    await loadGraph();
+  } catch (e) { alert('Open failed: ' + e); }
+}
+
+async function saveAsConfig(){
+  try {
+    const res = await fetch('/dialog/save_as', { method: 'POST' });
+    if (!res.ok) { alert('Save As failed: ' + await res.text()); return; }
+    const payload = await res.json();
+    if (!payload.ok) return; // cancelled
+    cfgNameEl.textContent = payload.config_path;
+    await loadSequences();
+    await loadGraph();
+  } catch (e) { alert('Save As failed: ' + e); }
 }
 
 async function loadGraph() {
@@ -681,10 +784,31 @@ async function saveEdits() {
   await loadGraph(); // refresh with updated YAML
 }
 
+async function deleteCurrentNode(){
+  try {
+    if (!currentNodeData) return;
+    const confirmDelete = confirm(`Delete node index ${currentNodeData.index}? This cannot be undone.`);
+    if (!confirmDelete) return;
+    const seq = currentSeqId;
+    const res = await fetch('/delete_nodes', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sequence_id: seq, indices: [currentNodeData.index] })
+    });
+    if (!res.ok) { alert('Delete failed: ' + await res.text()); return; }
+    closeModal();
+    await loadGraph();
+  } catch (e) { alert('Delete failed: ' + e); }
+}
+
 refreshBtn.addEventListener('click', loadGraph);
+openBtn.addEventListener('click', chooseFileAndSetConfig);
+saveAsBtn.addEventListener('click', saveAsConfig);
 closeBtn.addEventListener('click', closeModal);
 saveBtn.addEventListener('click', saveEdits);
 seqSelect.addEventListener('change', () => { clearStagedLinks(); loadGraph(); });
+if (saveBarSaveAsBtn) saveBarSaveAsBtn.addEventListener('click', saveAsConfig);
+if (saveAsBtnModal) saveAsBtnModal.addEventListener('click', saveAsConfig);
+if (deleteBtn) deleteBtn.addEventListener('click', deleteCurrentNode);
 
 // ---- Drag & Drop helpers ----
 function renderOutputsPanel() {
@@ -1256,7 +1380,7 @@ function showLibraryDetails(cls, m){
 
 @app.get("/sequences")
 def sequences():
-    docs = load_all_docs(CONFIG_PATH)
+    docs = load_all_docs(get_config_path())
     _, seq_doc = find_doc_by_section(docs, "SequenceConfig")
     seqs = get_sequences(seq_doc)
 
@@ -1269,7 +1393,7 @@ def sequences():
         })
 
     return jsonify({
-        "config_path": str(Path(CONFIG_PATH).resolve()),
+        "config_path": str(Path(get_config_path()).resolve()),
         "sequences": out
     })
 
@@ -1336,10 +1460,91 @@ def get_library():
 
     return jsonify({"classes": classes, "dir": str(lib_dir.resolve())})
 
+@app.post("/set_config")
+def set_config():
+    """
+    Body: { path: "C:/path/to/config.yml" }
+    Sets the current config path used by the app (no file writes here).
+    Returns resolved path and basic validation status.
+    """
+    data = request.get_json(force=True) or {}
+    path = data.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return Response("path is required", status=400)
+    try:
+        p = Path(path)
+        # allow non-existing path to be created later, but warn if parent missing
+        if p.exists():
+            # quick load to validate YAML if file exists
+            load_all_docs(str(p))
+        else:
+            if not p.parent.exists():
+                return Response("parent directory does not exist", status=400)
+        set_config_path(str(p))
+        return jsonify({"ok": True, "config_path": str(p.resolve())})
+    except Exception as e:
+        return Response(f"invalid config: {e}", status=400)
+
+@app.post("/save_as")
+def save_as():
+    """
+    Body: { path: "C:/new/config.yml" }
+    Saves the current in-memory YAML docs to a new file and switches to it.
+    """
+    data = request.get_json(force=True) or {}
+    path = data.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return Response("path is required", status=400)
+    target = Path(path)
+    if not target.parent.exists():
+        return Response("parent directory does not exist", status=400)
+    try:
+        # Load current docs then write to new path
+        docs = load_all_docs(get_config_path())
+        save_all_docs(str(target), docs)
+        set_config_path(str(target))
+        return jsonify({"ok": True, "config_path": str(target.resolve())})
+    except Exception as e:
+        return Response(f"save failed: {e}", status=400)
+
+@app.post("/dialog/open_config")
+def dialog_open_config():
+    """Open native file dialog to select a YAML config; switch to it if chosen."""
+    # Seed with current file directory if available
+    cur = Path(get_config_path())
+    initial_dir = str((cur.parent if cur.exists() else Path.cwd()).resolve())
+    chosen = _open_file_dialog(initial_dir=initial_dir, title="Open Config YAML")
+    if not chosen:
+        return jsonify({"ok": False, "cancelled": True})
+    try:
+        # Validate load
+        load_all_docs(chosen)
+        set_config_path(chosen)
+        return jsonify({"ok": True, "config_path": str(Path(chosen).resolve())})
+    except Exception as e:
+        return Response(f"invalid config: {e}", status=400)
+
+@app.post("/dialog/save_as")
+def dialog_save_as():
+    """Open native Save As dialog; write current docs to chosen path and switch."""
+    cur = Path(get_config_path())
+    initial_dir = str((cur.parent if cur.parent.exists() else Path.cwd()).resolve())
+    initial_file = cur.name if cur.name else "config.yml"
+    chosen = _save_file_dialog(initial_dir=initial_dir, initial_file=initial_file, title="Save Config As")
+    if not chosen:
+        return jsonify({"ok": False, "cancelled": True})
+    try:
+        docs = load_all_docs(get_config_path())
+        save_all_docs(chosen, docs)
+        set_config_path(chosen)
+        return jsonify({"ok": True, "config_path": str(Path(chosen).resolve())})
+    except Exception as e:
+        return Response(f"save failed: {e}", status=400)
+
 @app.get("/graph")
 def graph():
     seq_id = request.args.get("sequence", default=None, type=str)
-    docs = load_all_docs(CONFIG_PATH)
+    docs = load_all_docs(get_config_path())
     _, seq_doc = find_doc_by_section(docs, "SequenceConfig")
     seqs = get_sequences(seq_doc)
 
@@ -1375,7 +1580,7 @@ def update_node():
     if node_index is None:
         return Response("node_index is required", status=400)
 
-    docs = load_all_docs(CONFIG_PATH)
+    docs = load_all_docs(get_config_path())
     seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
     seqs = get_sequences(seq_doc)
 
@@ -1404,7 +1609,7 @@ def update_node():
 
     # Persist back
     docs[seq_doc_idx]["sequences"][sequence_idx]["module_sequence"][int(node_index)] = node
-    save_all_docs(CONFIG_PATH, docs)
+    save_all_docs(get_config_path(), docs)
 
     return jsonify({"ok": True, "node_index": node_index})
 
@@ -1426,7 +1631,7 @@ def add_nodes():
     if not isinstance(inserts, list) or not inserts:
         return jsonify({"ok": True, "assigned_indices": {}})
 
-    docs = load_all_docs(CONFIG_PATH)
+    docs = load_all_docs(get_config_path())
     seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
     seqs = get_sequences(seq_doc)
 
@@ -1475,9 +1680,60 @@ def add_nodes():
 
     # Persist
     docs[seq_doc_idx]["sequences"][sequence_idx]["module_sequence"] = modules
-    save_all_docs(CONFIG_PATH, docs)
+    save_all_docs(get_config_path(), docs)
 
     return jsonify({"ok": True, "assigned_indices": assigned})
+
+@app.post("/delete_nodes")
+def delete_nodes():
+    """
+    Body: {
+      sequence_id: 0,
+      indices: [2, 5, 7]
+    }
+    Deletes the specified node indices from the current sequence.
+    Returns the remaining length.
+    """
+    data = request.get_json(force=True)
+    seq_id = data.get("sequence_id")
+    indices = data.get("indices", [])
+    if not isinstance(indices, list) or not all(isinstance(i, int) for i in indices):
+        return Response("indices must be a list of integers", status=400)
+
+    docs = load_all_docs(get_config_path())
+    seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
+    seqs = get_sequences(seq_doc)
+
+    # choose sequence
+    sequence = None
+    sequence_idx = 0
+    if seq_id is not None:
+        for i, s in enumerate(seqs):
+            if str(s.get("id")) == str(seq_id):
+                sequence = s
+                sequence_idx = i
+                break
+    if sequence is None:
+        sequence = seqs[0]
+        sequence_idx = 0
+
+    modules = sequence.get("module_sequence", [])
+    if not isinstance(modules, list):
+        return Response("module_sequence must be a list", status=400)
+
+    # Remove unique sorted indices from end to start to avoid shifting problems
+    to_delete = sorted(set([i for i in indices if 0 <= i < len(modules)]), reverse=True)
+    for idx in to_delete:
+        try:
+            modules.pop(idx)
+        except Exception:
+            pass
+
+    # Persist
+    docs[seq_doc_idx]["sequences"][sequence_idx]["module_sequence"] = modules
+    save_all_docs(get_config_path(), docs)
+
+    return jsonify({"ok": True, "remaining": len(modules)})
 
 if __name__ == "__main__":
     app.run(debug=True)
