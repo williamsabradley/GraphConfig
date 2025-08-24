@@ -335,8 +335,8 @@ sequences:
     camera_id: {{ i+1 }}
     packet: 'FrothIQ'
   - module: 'cAdvanced_SpeedySocket_FrothIQ2.send_frothIQ_segmentation'
-    ref_seg: { 'module': 'Get_Prediction','name': 'raw_mask','order': 0 }
-    ref_im: { 'module': 'Get_Prediction','name': 'raw_im','order': 0 }
+    ref_seg: { 'module': 'Get_Prediction_Async','name': 'raw_mask','order': 0 }
+    ref_im: { 'module': 'Get_Prediction_Async','name': 'raw_im','order': 0 }
     ref_data_x: { 'module': 'Calculate_PSD','name': 'Percent_x_mm','order': 0 }
     ref_data_y: { 'module': 'Calculate_PSD','name': 'Percent_y_mm','order': 0 }
     ref_df: { 'module': 'Calculate_PSD','name': 'dataframe','order': 0 }
