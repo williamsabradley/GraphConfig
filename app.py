@@ -248,7 +248,7 @@ def index() -> Response:
     html, body { height: 100%; margin: 0; font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
     .app { display: grid; grid-template-rows: 56px 1fr; height: 100%; }
     header { display: flex; gap: 12px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #e5e7eb; }
-    #cy { width: 100%; height: calc(100vh - 56px); }
+    #cy { width: 100%; height: calc(100vh - 56px); background: #ffffff; }
     .pill { padding: 6px 10px; border: 1px solid #e5e7eb; border-radius: 9999px; background: #fff; }
     .primary { background: #111827; color: #fff; border-color: #111827; cursor: pointer; }
     .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: none; align-items: center; justify-content: center; }
@@ -263,8 +263,13 @@ def index() -> Response:
     .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
     .muted { color: #6b7280; font-size: 12px; }
     .danger { background: #b91c1c; border-color: #b91c1c; }
-    .savebar { position: fixed; left: 0; right: 0; bottom: 0; background: #064e3b; color: #ecfdf5; display: none; align-items: center; justify-content: space-between; padding: 10px 14px; }
+    .savebar { position: fixed; left: 0; right: 0; bottom: 0; background: #064e3b; color: #ecfdf5; display: none; align-items: center; justify-content: space-between; padding: 10px 14px; z-index: 1001; }
     .savebar .pill { background: #065f46; border-color: #10b981; color: #ecfdf5; }
+    .lib-panel { position: fixed; top: 56px; right: 0; width: min(360px, 36vw); height: calc(100vh - 56px); background: #fff; border-left: 1px solid #e5e7eb; display: flex; flex-direction: column; padding-bottom: 56px; z-index: 1000; }
+    .lib-header { display: flex; gap: 8px; align-items: center; padding: 10px; border-bottom: 1px solid #e5e7eb; }
+    .lib-body { padding: 10px; overflow: auto; display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .lib-card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 8px; }
+    .lib-card h4 { margin: 0 0 6px; font-size: 14px; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
   </style>
   <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
@@ -293,6 +298,16 @@ def index() -> Response:
       <button id="applyStagedBtn" class="pill primary">Save Changes</button>
     </div>
   </div>
+
+  <aside id="libPanel" class="lib-panel">
+    <div class="lib-header">
+      <strong>Library</strong>
+      <select id="libClassSelect" style="flex:1;">
+        <option value="">Select class…</option>
+      </select>
+    </div>
+    <div class="lib-body" id="libBody"></div>
+  </aside>
 
   <div class="modal-backdrop" id="modalBackdrop">
     <div class="modal">
@@ -357,12 +372,19 @@ const saveBar = document.getElementById('saveBar');
 const saveMsg = document.getElementById('saveMsg');
 const applyStagedBtn = document.getElementById('applyStagedBtn');
 const discardStagedBtn = document.getElementById('discardStagedBtn');
+const libPanel = document.getElementById('libPanel');
+const libClassSelect = document.getElementById('libClassSelect');
+const libBody = document.getElementById('libBody');
 
 let cy;
 let currentSeqId = null;
 let currentNode = null; // cytoscape node
 let currentNodeData = null; // its data blob
 let stagedLinks = []; // { source_index, source_func, output_name, target_index, target_key }
+let stagedAdds = []; // { staged_id, full, cls, func, params, dropY, outputs }
+let stagedAddCounter = 0;
+const VERTICAL_SPACING = 140;
+let library = { classToModules: {} };
 
 function escapeHtml(s) {
   return (s ?? '').toString()
@@ -399,11 +421,23 @@ async function loadGraph() {
     ...g.edges
   ];
 
+  if (typeof cytoscape === 'undefined') {
+    statusEl.textContent = 'Error: graph library failed to load. Check network access to unpkg.com.';
+    return;
+  }
+
   if (!cy) {
-    const verticalSpacing = 140;
+    const verticalSpacing = VERTICAL_SPACING;
     cy = cytoscape({
       container: document.getElementById('cy'),
       elements,
+      pixelRatio: 1,
+      textureOnViewport: true,
+      motionBlur: true,
+      motionBlurOpacity: 0.2,
+      hideEdgesOnViewport: true,
+      hideLabelsOnViewport: true,
+      wheelSensitivity: 0.2,
       layout: {
         name: 'preset',
         positions: function(node){
@@ -415,7 +449,7 @@ async function loadGraph() {
         { selector: 'node',
           style: {
             'shape': 'round-rectangle',
-            'background-color': 'data(cls_color)',
+            'background-color': '#111827',
             'border-color': '#e5e7eb',
             'border-width': 1,
             'color': '#fff',
@@ -429,6 +463,7 @@ async function loadGraph() {
             'height': 'label'
           }
         },
+        { selector: 'node[cls_color]', style: { 'background-color': 'data(cls_color)' } },
         { selector: 'edge',
           style: {
             'curve-style': 'bezier',
@@ -447,6 +482,7 @@ async function loadGraph() {
         { selector: 'edge[edge_type = "input"]', style: { 'line-color': '#2563eb', 'target-arrow-color': '#2563eb' } },
         { selector: 'edge[edge_type = "same_class"]', style: { 'line-color': '#f97316', 'target-arrow-color': '#f97316', 'line-style': 'dashed' } },
         { selector: 'edge[edge_type = "staged"]', style: { 'line-color': '#10b981', 'target-arrow-color': '#10b981', 'line-style': 'solid' } },
+        { selector: 'node[staged]', style: { 'border-width': 3, 'border-color': '#10b981' } },
         { selector: 'node:selected', style: { 'background-color': '#2563eb' } }
       ]
     });
@@ -455,22 +491,30 @@ async function loadGraph() {
     setupCyDnD();
     setupRightDrag();
     applyClassColors();
+    buildLibraryFromCy();
   } else {
-    const verticalSpacing = 140;
+    const verticalSpacing = VERTICAL_SPACING;
     cy.elements().remove();
     cy.add(elements);
-    cy.layout({
-      name: 'preset',
-      positions: function(node){
-        const idx = node.data('index') ?? 0;
-        return { x: 0, y: idx * verticalSpacing };
-      }
-    }).run();
+    // fallback layout to prevent invisible graph if indices missing
+    try {
+      cy.layout({
+        name: 'preset',
+        positions: function(node){
+          const idx = node.data('index') ?? 0;
+          return { x: 0, y: idx * verticalSpacing };
+        }
+      }).run();
+    } catch (e) {
+      cy.layout({ name: 'grid', rows: Math.ceil(Math.sqrt(g.nodes.length || 1)) }).run();
+    }
+    buildLibraryFromCy();
   }
   // Ensure class colors applied on (re)load
   applyClassColors();
   // Re-add staged edges as green overlays
   renderStagedEdges();
+  renderStagedAdds();
   statusEl.textContent = '';
 }
 
@@ -694,6 +738,9 @@ outputsBtn.addEventListener('click', () => {
   outputsPanel.style.display = isShown ? 'none' : 'block';
   if (!isShown) renderOutputsPanel();
 });
+if (typeof libClassSelect !== 'undefined' && libClassSelect) {
+  libClassSelect.addEventListener('change', renderLibraryModules);
+}
 
 // ---- Drop onto graph to choose mapping ----
 let pendingLink = null; // { source_index, source_func, output_name, target_index }
@@ -774,10 +821,49 @@ function renderStagedEdges(){
   if (toAdd.length) cy.add(toAdd);
 }
 
+function renderStagedAdds(){
+  if (!cy) return;
+  // remove previous staged nodes
+  cy.nodes('[staged]').remove();
+  const toAdd = stagedAdds.map(a => ({
+    group: 'nodes',
+    data: {
+      id: a.staged_id,
+      label: `${a.func}\n[${a.cls}]`,
+      index: null,
+      cls: a.cls,
+      func: a.func,
+      full: a.full,
+      params: a.params,
+      staged: true,
+      outputs: a.outputs || []
+    }
+  }));
+  if (toAdd.length) {
+    const eles = cy.add(toAdd);
+    eles.forEach((n, idx) => {
+      n.position({ x: 0, y: stagedAdds[idx].dropY });
+    });
+    applyClassColors();
+  }
+}
+
+function addStagedNodeAt(payload, dropY){
+  const staged_id = `sn${++stagedAddCounter}`;
+  const outs = (library.classToModules[payload.cls]?.find(m => m.func === payload.func)?.outputs) || [];
+  stagedAdds.push({ staged_id, full: payload.full, cls: payload.cls, func: payload.func, params: JSON.parse(JSON.stringify(payload.params || {})), dropY, outputs: outs });
+  renderStagedAdds();
+  updateSaveBarVisibility();
+}
+
 function updateSaveBarVisibility(){
-  if (stagedLinks.length > 0) {
+  const total = stagedLinks.length + stagedAdds.length;
+  if (total > 0) {
     saveBar.style.display = 'flex';
-    saveMsg.textContent = `You have ${stagedLinks.length} pending connection${stagedLinks.length>1?'s':''}.`;
+    const parts = [];
+    if (stagedLinks.length) parts.push(`${stagedLinks.length} connection${stagedLinks.length>1?'s':''}`);
+    if (stagedAdds.length) parts.push(`${stagedAdds.length} node${stagedAdds.length>1?'s':''}`);
+    saveMsg.textContent = `You have pending: ${parts.join(', ')}.`;
   } else {
     saveBar.style.display = 'none';
   }
@@ -785,18 +871,39 @@ function updateSaveBarVisibility(){
 
 discardStagedBtn.addEventListener('click', () => {
   stagedLinks = [];
+  stagedAdds = [];
   renderStagedEdges();
+  renderStagedAdds();
   updateSaveBarVisibility();
 });
 
 applyStagedBtn.addEventListener('click', async () => {
-  if (!stagedLinks.length) return;
+  if (!stagedLinks.length && !stagedAdds.length) return;
   statusEl.textContent = 'Saving changes...';
-  // group updates by target_index
+  // First, insert staged nodes by vertical order
+  let stagedIndexMap = {}; // staged_id -> new index
+  if (stagedAdds.length) {
+    const plan = computeInsertionPlan();
+    const res = await fetch('/add_nodes', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sequence_id: currentSeqId, inserts: plan.inserts })
+    });
+    if (!res.ok) {
+      statusEl.textContent = 'Save failed';
+      alert('Save failed (adding nodes): ' + await res.text());
+      return;
+    }
+    const mapping = await res.json();
+    stagedIndexMap = mapping.assigned_indices || {};
+  }
+
+  // group updates by target (existing or newly inserted)
   const groups = {};
   stagedLinks.forEach(l => {
-    const key = String(l.target_index);
-    groups[key] = groups[key] || { node_index: l.target_index, updates: {} };
+    const keyIndex = (l.target_index != null) ? l.target_index : stagedIndexMap[l.target_staged_id];
+    if (keyIndex == null) return;
+    const key = String(keyIndex);
+    groups[key] = groups[key] || { node_index: keyIndex, updates: {} };
     groups[key].updates[l.target_key] = { module: l.source_func, name: l.output_name, order: 0 };
   });
   const payloads = Object.values(groups);
@@ -814,6 +921,7 @@ applyStagedBtn.addEventListener('click', async () => {
     }
     statusEl.textContent = 'Saved';
     stagedLinks = [];
+    stagedAdds = [];
     updateSaveBarVisibility();
     await loadGraph();
   } catch (e) {
@@ -824,7 +932,9 @@ applyStagedBtn.addEventListener('click', async () => {
 
 function clearStagedLinks(){
   stagedLinks = [];
+  stagedAdds = [];
   renderStagedEdges();
+  renderStagedAdds();
   updateSaveBarVisibility();
 }
 
@@ -842,6 +952,10 @@ function setupCyDnD(){
     const rx = e.clientX - rect.left; // rendered coords
     const ry = e.clientY - rect.top;
     const target = nodeAtRenderedPoint(rx, ry);
+    if (data.kind === 'lib_node') {
+      addStagedNodeAt(data, ry);
+      return;
+    }
     if (!target) return;
     // If dropping onto the same node, ignore
     if ((target.data('index')||-1) === data.source_index) return;
@@ -938,11 +1052,85 @@ function endRightDrag(){
   dragOverlay = null;
 }
 
+// ---- Library ----
+function buildLibraryFromCy(){
+  if (!cy) return;
+  const map = {};
+  cy.nodes().forEach(n => {
+    if (n.data('staged')) return;
+    const cls = n.data('cls') || '';
+    const func = n.data('func');
+    const full = n.data('full');
+    const params = n.data('params') || {};
+    const outputs = n.data('outputs') || [];
+    if (!cls || !func) return;
+    map[cls] = map[cls] || [];
+    if (!map[cls].some(m => m.func === func)) {
+      map[cls].push({ func, full, params, outputs });
+    }
+  });
+  library.classToModules = map;
+  // populate class select
+  if (typeof libClassSelect === 'undefined') return;
+  const current = libClassSelect.value;
+  libClassSelect.innerHTML = '<option value="">Select class…</option>';
+  Object.keys(map).sort().forEach(c => {
+    const opt = document.createElement('option'); opt.value = c; opt.textContent = c; libClassSelect.appendChild(opt);
+  });
+  if (current && map[current]) libClassSelect.value = current; else libClassSelect.value = '';
+  renderLibraryModules();
+}
+
+function renderLibraryModules(){
+  if (typeof libBody === 'undefined') return;
+  const cls = libClassSelect.value;
+  libBody.innerHTML = '';
+  if (!cls) return;
+  const mods = library.classToModules[cls] || [];
+  mods.forEach(m => {
+    const card = document.createElement('div');
+    card.className = 'lib-card';
+    const title = document.createElement('h4'); title.textContent = m.func; card.appendChild(title);
+    const info = document.createElement('div'); info.className = 'muted'; info.textContent = m.full; card.appendChild(info);
+    const btns = document.createElement('div'); btns.style.display = 'flex'; btns.style.gap = '6px'; btns.style.marginTop = '6px';
+    const viewBtn = document.createElement('button'); viewBtn.className = 'pill'; viewBtn.textContent = 'View';
+    viewBtn.addEventListener('click', () => showLibraryDetails(cls, m));
+    btns.appendChild(viewBtn);
+    card.appendChild(btns);
+    card.setAttribute('draggable', 'true');
+    card.addEventListener('dragstart', (e) => {
+      const payload = { kind: 'lib_node', cls, func: m.func, full: m.full, params: m.params };
+      e.dataTransfer.setData('application/json', JSON.stringify(payload));
+      e.dataTransfer.effectAllowed = 'copy';
+    });
+    libBody.appendChild(card);
+  });
+}
+
+function showLibraryDetails(cls, m){
+  if (!modalTitle) return;
+  currentNode = null; currentNodeData = null;
+  modalTitle.textContent = `Template: ${m.func} [${cls}]`;
+  nodeMeta.innerHTML = `<span class="muted">module: <code>${escapeHtml(m.full)}</code></span>`;
+  formGrid.innerHTML = '';
+  const params = m.params || {};
+  Object.keys(params).forEach((key) => {
+    const v = params[key];
+    const wrap = document.createElement('div'); wrap.className = 'field';
+    const label = document.createElement('label'); label.textContent = key; wrap.appendChild(label);
+    const pre = document.createElement('textarea'); pre.rows = 4; pre.value = JSON.stringify(v, null, 2); pre.readOnly = true; wrap.appendChild(pre);
+    formGrid.appendChild(wrap);
+  });
+  openModal(null);
+}
+
 // boot
 (async function init() {
   try {
     await loadSequences();
     await loadGraph();
+    // Build library after first load
+    buildLibraryFromCy();
   } catch (e) {
     statusEl.textContent = 'Error: ' + e;
   }
@@ -1043,6 +1231,77 @@ def update_node():
     save_all_docs(CONFIG_PATH, docs)
 
     return jsonify({"ok": True, "node_index": node_index})
+
+@app.post("/add_nodes")
+def add_nodes():
+    """
+    Body: {
+      sequence_id: 0,
+      inserts: [
+        { staged_id: "sn1", index: 3, node: { module: "cFoo.Bar", ...params } },
+        ...
+      ]
+    }
+    Returns: { ok: True, assigned_indices: { "sn1": 3, ... } }
+    """
+    data = request.get_json(force=True)
+    seq_id = data.get("sequence_id")
+    inserts = data.get("inserts", [])
+    if not isinstance(inserts, list) or not inserts:
+        return jsonify({"ok": True, "assigned_indices": {}})
+
+    docs = load_all_docs(CONFIG_PATH)
+    seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
+    seqs = get_sequences(seq_doc)
+
+    # choose sequence
+    sequence = None
+    sequence_idx = 0
+    if seq_id is not None:
+        for i, s in enumerate(seqs):
+            if str(s.get("id")) == str(seq_id):
+                sequence = s
+                sequence_idx = i
+                break
+    if sequence is None:
+        sequence = seqs[0]
+        sequence_idx = 0
+
+    modules = sequence.get("module_sequence", [])
+    if not isinstance(modules, list):
+        return Response("module_sequence must be a list", status=400)
+
+    # Prepare insertion plan: sort by desired index, then insert while tracking shifts
+    plan = []
+    for ins in inserts:
+        try:
+            staged_id = ins.get("staged_id")
+            idx = int(ins.get("index", len(modules)))
+            node = ins.get("node", {})
+        except Exception:
+            continue
+        plan.append({"staged_id": staged_id, "index": idx, "node": node})
+    plan.sort(key=lambda x: x["index"])  # ascending
+
+    assigned: Dict[str, int] = {}
+    shift = 0
+    current_len = len(modules)
+    for item in plan:
+        desired = item["index"]
+        if desired < 0:
+            desired = 0
+        if desired > current_len + shift:
+            desired = current_len + shift
+        final_index = desired
+        modules.insert(final_index, item["node"])  # mutate in place
+        assigned[item["staged_id"]] = final_index
+        shift += 1
+
+    # Persist
+    docs[seq_doc_idx]["sequences"][sequence_idx]["module_sequence"] = modules
+    save_all_docs(CONFIG_PATH, docs)
+
+    return jsonify({"ok": True, "assigned_indices": assigned})
 
 if __name__ == "__main__":
     app.run(debug=True)
