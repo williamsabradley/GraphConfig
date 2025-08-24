@@ -65,6 +65,8 @@ def build_graph_from_sequence(sequence: dict) -> dict:
         raise ValueError("sequence.module_sequence must be a list.")
     nodes = []
     edges = []
+    # Track discovered outputs for each node index
+    outputs_by_index: Dict[int, set] = {}
 
     # Map function name -> list of indices where it appears
     func_to_indices: Dict[str, List[int]] = {}
@@ -91,6 +93,14 @@ def build_graph_from_sequence(sequence: dict) -> dict:
             }
         })
         func_to_indices.setdefault(func, []).append(i)
+
+        # Seed outputs with any explicit 'outputs' declared on the node
+        try:
+            explicit_outputs = mod.get("outputs", {})
+            if isinstance(explicit_outputs, dict):
+                outputs_by_index.setdefault(i, set()).update(list(explicit_outputs.keys()))
+        except Exception:
+            pass
 
         # Create an edge between consecutive nodes of the same class
         if cls:
@@ -149,7 +159,15 @@ def build_graph_from_sequence(sequence: dict) -> dict:
                             "edge_type": "input",
                         }
                     })
+                    # Record that the source node produces this output name
+                    if label:
+                        outputs_by_index.setdefault(src_idx, set()).add(label)
             # if list/str etc., ignore—only dicts have module/name/order semantics
+
+    # Attach outputs to node data
+    for i, node in enumerate(nodes):
+        outs = sorted(list(outputs_by_index.get(i, set())))
+        node.get("data", {}).update({"outputs": outs})
 
     return {"nodes": nodes, "edges": edges}
 
@@ -245,6 +263,8 @@ def index() -> Response:
     .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
     .muted { color: #6b7280; font-size: 12px; }
     .danger { background: #b91c1c; border-color: #b91c1c; }
+    .savebar { position: fixed; left: 0; right: 0; bottom: 0; background: #064e3b; color: #ecfdf5; display: none; align-items: center; justify-content: space-between; padding: 10px 14px; }
+    .savebar .pill { background: #065f46; border-color: #10b981; color: #ecfdf5; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
   </style>
   <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
@@ -266,14 +286,48 @@ def index() -> Response:
     <div id="cy"></div>
   </div>
 
+  <div id="saveBar" class="savebar">
+    <div><strong id="saveMsg">You have pending connections.</strong></div>
+    <div class="row" style="margin:0;">
+      <button id="discardStagedBtn" class="pill">Discard</button>
+      <button id="applyStagedBtn" class="pill primary">Save Changes</button>
+    </div>
+  </div>
+
   <div class="modal-backdrop" id="modalBackdrop">
     <div class="modal">
       <h2 id="modalTitle">Edit Node</h2>
       <div class="muted" id="nodeMeta"></div>
       <div class="grid" id="formGrid"></div>
       <div class="row">
+        <button id="outputsBtn" class="pill">Outputs</button>
         <button id="closeBtn" class="pill">Close</button>
         <button id="saveBtn" class="pill primary">Save</button>
+      </div>
+      <div id="outputsPanel" style="display:none; margin-top:10px; border-top:1px solid #e5e7eb; padding-top:10px;">
+        <div class="muted" style="margin-bottom:6px;">Drag an output from this node onto another node in the graph to link it, or onto a ref_* field below.</div>
+        <div id="outputsList" style="display:flex; flex-wrap: wrap; gap: 8px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="linkerBackdrop" style="display:none;">
+    <div class="modal" style="max-width: 520px;">
+      <h2 style="margin-bottom:8px;">Connect Nodes</h2>
+      <div class="muted" id="linkerMeta"></div>
+      <div class="grid" style="margin-top:10px;">
+        <div class="field">
+          <label for="linkerSourceOutput">Source output</label>
+          <select id="linkerSourceOutput"></select>
+        </div>
+        <div class="field">
+          <label for="linkerTargetInput">Target input (ref_*)</label>
+          <select id="linkerTargetInput"></select>
+        </div>
+      </div>
+      <div class="row">
+        <button id="linkerCancel" class="pill">Cancel</button>
+        <button id="linkerApply" class="pill primary">Connect</button>
       </div>
     </div>
   </div>
@@ -290,11 +344,25 @@ const nodeMeta = document.getElementById('nodeMeta');
 const formGrid = document.getElementById('formGrid');
 const closeBtn = document.getElementById('closeBtn');
 const saveBtn = document.getElementById('saveBtn');
+const outputsBtn = document.getElementById('outputsBtn');
+const outputsPanel = document.getElementById('outputsPanel');
+const outputsList = document.getElementById('outputsList');
+const linkerBackdrop = document.getElementById('linkerBackdrop');
+const linkerMeta = document.getElementById('linkerMeta');
+const linkerSourceOutput = document.getElementById('linkerSourceOutput');
+const linkerTargetInput = document.getElementById('linkerTargetInput');
+const linkerCancel = document.getElementById('linkerCancel');
+const linkerApply = document.getElementById('linkerApply');
+const saveBar = document.getElementById('saveBar');
+const saveMsg = document.getElementById('saveMsg');
+const applyStagedBtn = document.getElementById('applyStagedBtn');
+const discardStagedBtn = document.getElementById('discardStagedBtn');
 
 let cy;
 let currentSeqId = null;
 let currentNode = null; // cytoscape node
 let currentNodeData = null; // its data blob
+let stagedLinks = []; // { source_index, source_func, output_name, target_index, target_key }
 
 function escapeHtml(s) {
   return (s ?? '').toString()
@@ -378,11 +446,14 @@ async function loadGraph() {
         },
         { selector: 'edge[edge_type = "input"]', style: { 'line-color': '#2563eb', 'target-arrow-color': '#2563eb' } },
         { selector: 'edge[edge_type = "same_class"]', style: { 'line-color': '#f97316', 'target-arrow-color': '#f97316', 'line-style': 'dashed' } },
+        { selector: 'edge[edge_type = "staged"]', style: { 'line-color': '#10b981', 'target-arrow-color': '#10b981', 'line-style': 'solid' } },
         { selector: 'node:selected', style: { 'background-color': '#2563eb' } }
       ]
     });
 
     cy.on('tap', 'node', onNodeTap);
+    setupCyDnD();
+    setupRightDrag();
   } else {
     const verticalSpacing = 140;
     cy.elements().remove();
@@ -395,6 +466,8 @@ async function loadGraph() {
       }
     }).run();
   }
+  // Re-add staged edges as green overlays
+  renderStagedEdges();
   statusEl.textContent = '';
 }
 
@@ -431,6 +504,10 @@ function buildField(key, value) {
     ta.id = `f_${key}`;
     ta.value = JSON.stringify(value, null, 2);
     ta.dataset.type = 'json';
+    // Make ref_* fields droppable
+    if (typeof key === 'string' && key.startsWith('ref_')) {
+      makeDroppable(ta, key);
+    }
     wrap.appendChild(ta);
   } else {
     const input = document.createElement('input');
@@ -438,6 +515,9 @@ function buildField(key, value) {
     input.id = `f_${key}`;
     input.value = value ?? '';
     input.dataset.type = 'text';
+    if (typeof key === 'string' && key.startsWith('ref_')) {
+      makeDroppable(input, key);
+    }
     wrap.appendChild(input);
   }
   return wrap;
@@ -469,6 +549,8 @@ function onNodeTap(evt) {
   });
 
   openModal(currentNode);
+  // Render outputs for this node only
+  renderOutputsPanel();
 }
 
 async function saveEdits() {
@@ -514,7 +596,317 @@ async function saveEdits() {
 refreshBtn.addEventListener('click', loadGraph);
 closeBtn.addEventListener('click', closeModal);
 saveBtn.addEventListener('click', saveEdits);
-seqSelect.addEventListener('change', loadGraph);
+seqSelect.addEventListener('change', () => { clearStagedLinks(); loadGraph(); });
+
+// ---- Drag & Drop helpers ----
+function renderOutputsPanel() {
+  if (!cy || !currentNode) return;
+  outputsList.innerHTML = '';
+  const outs = currentNode.data('outputs') || [];
+  outs.forEach(name => {
+    const chip = document.createElement('span');
+    chip.textContent = name;
+    chip.className = 'pill';
+    chip.style.cursor = 'grab';
+    chip.setAttribute('draggable', 'true');
+    chip.addEventListener('dragstart', (e) => {
+      const payload = {
+        source_index: currentNode.data('index'),
+        source_func: currentNode.data('func'),
+        output_name: name
+      };
+      e.dataTransfer.setData('application/json', JSON.stringify(payload));
+      e.dataTransfer.effectAllowed = 'copy';
+    });
+    outputsList.appendChild(chip);
+  });
+}
+
+function makeDroppable(el, key) {
+  el.addEventListener('dragover', (e) => {
+    if (hasDnDData(e)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      el.style.outline = '2px dashed #2563eb';
+    }
+  });
+  el.addEventListener('dragleave', () => { el.style.outline = ''; });
+  el.addEventListener('drop', (e) => {
+    const data = getDnDData(e);
+    if (!data) return;
+    e.preventDefault();
+    el.style.outline = '';
+    const refObj = {
+      module: data.source_func,
+      name: data.output_name,
+      order: 0
+    };
+    // If it's a textarea showing json, pretty print
+    if (el.tagName === 'TEXTAREA') {
+      el.value = JSON.stringify(refObj, null, 2);
+      el.dataset.type = 'json';
+    } else {
+      el.value = JSON.stringify(refObj);
+      el.dataset.type = 'json';
+    }
+  });
+}
+
+function hasDnDData(e){
+  try { return Array.from(e.dataTransfer.types || []).includes('application/json'); } catch { return false; }
+}
+function getDnDData(e){
+  try { return JSON.parse(e.dataTransfer.getData('application/json')); } catch { return null; }
+}
+
+outputsBtn.addEventListener('click', () => {
+  const isShown = outputsPanel.style.display !== 'none';
+  outputsPanel.style.display = isShown ? 'none' : 'block';
+  if (!isShown) renderOutputsPanel();
+});
+
+// ---- Drop onto graph to choose mapping ----
+let pendingLink = null; // { source_index, source_func, output_name, target_index }
+function nodeAtRenderedPoint(rx, ry){
+  if (!cy) return null;
+  let found = null;
+  cy.nodes().forEach(n => {
+    const bb = n.renderedBoundingBox();
+    if (rx >= bb.x1 && rx <= bb.x2 && ry >= bb.y1 && ry <= bb.y2) {
+      found = n;
+    }
+  });
+  return found;
+}
+
+function openLinker(source, targetNode){
+  pendingLink = { ...source, target_index: targetNode.data('index') };
+  // Fill selects
+  linkerSourceOutput.innerHTML = '';
+  const srcNode = cy.nodes().filter(n => (n.data('index')||-1) === source.source_index)[0];
+  const srcOuts = (srcNode && srcNode.data('outputs')) || [];
+  srcOuts.forEach(o => {
+    const opt = document.createElement('option');
+    opt.value = o; opt.textContent = o; linkerSourceOutput.appendChild(opt);
+  });
+  linkerSourceOutput.value = source.output_name || (srcOuts[0] || '');
+
+  linkerTargetInput.innerHTML = '';
+  const params = targetNode.data('params') || {};
+  const refKeys = Object.keys(params).filter(k => k.startsWith('ref_'));
+  refKeys.forEach(k => {
+    const opt = document.createElement('option');
+    opt.value = k; opt.textContent = k; linkerTargetInput.appendChild(opt);
+  });
+
+  linkerMeta.innerHTML = `Source: <code>${escapeHtml(srcNode ? srcNode.data('func') : source.source_func)}</code> → Target: <code>${escapeHtml(targetNode.data('func'))}</code>`;
+  linkerBackdrop.style.display = 'flex';
+}
+
+function closeLinker(){
+  linkerBackdrop.style.display = 'none';
+  pendingLink = null;
+}
+
+linkerCancel.addEventListener('click', closeLinker);
+linkerApply.addEventListener('click', async () => {
+  if (!pendingLink) return;
+  const chosenOutput = linkerSourceOutput.value;
+  const targetKey = linkerTargetInput.value;
+  // Stage (do not persist yet)
+  stagedLinks.push({
+    source_index: pendingLink.source_index,
+    source_func: pendingLink.source_func,
+    output_name: chosenOutput,
+    target_index: pendingLink.target_index,
+    target_key: targetKey
+  });
+  closeLinker();
+  renderStagedEdges();
+  updateSaveBarVisibility();
+});
+
+// ---- Staged edges rendering and save bar ----
+function renderStagedEdges(){
+  if (!cy) return;
+  // remove previous staged edges
+  cy.edges('[edge_type = "staged"]').remove();
+  const toAdd = stagedLinks.map((l, i) => ({
+    group: 'edges',
+    data: {
+      id: `stg_${l.source_index}_${l.target_index}_${i}`,
+      source: `n${l.source_index}`,
+      target: `n${l.target_index}`,
+      label: `${l.output_name} → ${l.target_key}`,
+      edge_type: 'staged'
+    }
+  }));
+  if (toAdd.length) cy.add(toAdd);
+}
+
+function updateSaveBarVisibility(){
+  if (stagedLinks.length > 0) {
+    saveBar.style.display = 'flex';
+    saveMsg.textContent = `You have ${stagedLinks.length} pending connection${stagedLinks.length>1?'s':''}.`;
+  } else {
+    saveBar.style.display = 'none';
+  }
+}
+
+discardStagedBtn.addEventListener('click', () => {
+  stagedLinks = [];
+  renderStagedEdges();
+  updateSaveBarVisibility();
+});
+
+applyStagedBtn.addEventListener('click', async () => {
+  if (!stagedLinks.length) return;
+  statusEl.textContent = 'Saving changes...';
+  // group updates by target_index
+  const groups = {};
+  stagedLinks.forEach(l => {
+    const key = String(l.target_index);
+    groups[key] = groups[key] || { node_index: l.target_index, updates: {} };
+    groups[key].updates[l.target_key] = { module: l.source_func, name: l.output_name, order: 0 };
+  });
+  const payloads = Object.values(groups);
+  try {
+    const results = await Promise.all(payloads.map(g => fetch('/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sequence_id: currentSeqId, node_index: g.node_index, updates: g.updates })
+    })));
+    const firstBad = results.find(r => !r.ok);
+    if (firstBad) {
+      const txt = await firstBad.text();
+      statusEl.textContent = 'Save failed';
+      alert('Save failed: ' + txt);
+      return;
+    }
+    statusEl.textContent = 'Saved';
+    stagedLinks = [];
+    updateSaveBarVisibility();
+    await loadGraph();
+  } catch (e) {
+    statusEl.textContent = 'Save failed';
+    alert('Save failed: ' + e);
+  }
+});
+
+function clearStagedLinks(){
+  stagedLinks = [];
+  renderStagedEdges();
+  updateSaveBarVisibility();
+}
+
+function setupCyDnD(){
+  if (!cy) return;
+  const container = cy.container();
+  container.addEventListener('dragover', (e) => {
+    if (hasDnDData(e)) { e.preventDefault(); }
+  });
+  container.addEventListener('drop', (e) => {
+    const data = getDnDData(e);
+    if (!data) return;
+    e.preventDefault();
+    const rect = container.getBoundingClientRect();
+    const rx = e.clientX - rect.left; // rendered coords
+    const ry = e.clientY - rect.top;
+    const target = nodeAtRenderedPoint(rx, ry);
+    if (!target) return;
+    // If dropping onto the same node, ignore
+    if ((target.data('index')||-1) === data.source_index) return;
+    openLinker(data, target);
+  });
+}
+
+// ---- Right-click drag to connect (red arrow overlay) ----
+let dragOverlay = null; // { svg, line, onMouseMove, onMouseUp }
+function setupRightDrag(){
+  if (!cy) return;
+  const container = cy.container();
+  // Prevent default context menu inside graph area
+  container.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  cy.on('cxttapstart', 'node', (evt) => {
+    const source = evt.target;
+    beginRightDrag(source);
+  });
+}
+
+function beginRightDrag(sourceNode){
+  if (!cy) return;
+  endRightDrag();
+  const container = cy.container();
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('width', '100%');
+  svg.setAttribute('height', '100%');
+  svg.style.position = 'absolute';
+  svg.style.inset = '0';
+  svg.style.pointerEvents = 'none';
+  // marker arrowhead
+  const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+  const marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
+  marker.setAttribute('id', 'arrowhead');
+  marker.setAttribute('markerWidth', '8');
+  marker.setAttribute('markerHeight', '8');
+  marker.setAttribute('refX', '4');
+  marker.setAttribute('refY', '3');
+  marker.setAttribute('orient', 'auto');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M0,0 L0,6 L6,3 Z');
+  path.setAttribute('fill', '#b91c1c');
+  marker.appendChild(path);
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+  const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+  line.setAttribute('stroke', '#b91c1c');
+  line.setAttribute('stroke-width', '3');
+  line.setAttribute('x1', '0'); line.setAttribute('y1', '0');
+  line.setAttribute('x2', '0'); line.setAttribute('y2', '0');
+  line.setAttribute('marker-end', 'url(#arrowhead)');
+  svg.appendChild(line);
+  container.style.position = 'relative';
+  container.appendChild(svg);
+
+  const update = (clientX, clientY) => {
+    const src = sourceNode.renderedPosition();
+    line.setAttribute('x1', String(src.x));
+    line.setAttribute('y1', String(src.y));
+    const rect = container.getBoundingClientRect();
+    const rx = clientX - rect.left;
+    const ry = clientY - rect.top;
+    line.setAttribute('x2', String(rx));
+    line.setAttribute('y2', String(ry));
+  };
+
+  const onMouseMove = (e) => { update(e.clientX, e.clientY); };
+  const onMouseUp = (e) => {
+    e.preventDefault();
+    const rect = container.getBoundingClientRect();
+    const rx = e.clientX - rect.left;
+    const ry = e.clientY - rect.top;
+    const target = nodeAtRenderedPoint(rx, ry);
+    endRightDrag();
+    if (target && target.id() !== sourceNode.id()) {
+      // Open chooser without preselected output
+      openLinker({ source_index: sourceNode.data('index'), source_func: sourceNode.data('func'), output_name: '' }, target);
+    }
+  };
+
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp, { once: true });
+  dragOverlay = { svg, line, onMouseMove, onMouseUp };
+  // Seed start position
+  const lastMouse = cy.renderer().mouseLocation || { x: sourceNode.renderedPosition().x, y: sourceNode.renderedPosition().y };
+  update(lastMouse.x || sourceNode.renderedPosition().x, lastMouse.y || sourceNode.renderedPosition().y);
+}
+
+function endRightDrag(){
+  if (!dragOverlay) return;
+  document.removeEventListener('mousemove', dragOverlay.onMouseMove);
+  try { dragOverlay.svg.remove(); } catch {}
+  dragOverlay = null;
+}
 
 // boot
 (async function init() {
