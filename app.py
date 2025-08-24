@@ -467,6 +467,9 @@ async function loadGraph() {
     cy = cytoscape({
       container: document.getElementById('cy'),
       elements,
+      wheelSensitivity: 0.15,
+      minZoom: 0.05,
+      maxZoom: 5,
       pixelRatio: 1,
       textureOnViewport: true,
       motionBlur: true,
@@ -1024,8 +1027,8 @@ let dragOverlay = null; // { svg, line, onMouseMove, onMouseUp }
 function setupRightDrag(){
   if (!cy) return;
   const container = cy.container();
-  // Prevent default context menu inside graph area
-  container.addEventListener('contextmenu', (e) => e.preventDefault());
+  // Prevent default context menu inside graph area (and stop bubbling)
+  container.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); });
 
   cy.on('cxttapstart', 'node', (evt) => {
     const source = evt.target;
@@ -1037,6 +1040,9 @@ function beginRightDrag(sourceNode){
   if (!cy) return;
   endRightDrag();
   const container = cy.container();
+  // While dragging with right click, block any contextmenu globally
+  const blockCtx = (e) => { e.preventDefault(); e.stopPropagation(); };
+  document.addEventListener('contextmenu', blockCtx, true);
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('width', '100%');
   svg.setAttribute('height', '100%');
@@ -1095,7 +1101,7 @@ function beginRightDrag(sourceNode){
 
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('mouseup', onMouseUp, { once: true });
-  dragOverlay = { svg, line, onMouseMove, onMouseUp };
+  dragOverlay = { svg, line, onMouseMove, onMouseUp, blockCtx };
   // Seed start position
   const lastMouse = cy.renderer().mouseLocation || { x: sourceNode.renderedPosition().x, y: sourceNode.renderedPosition().y };
   update(lastMouse.x || sourceNode.renderedPosition().x, lastMouse.y || sourceNode.renderedPosition().y);
@@ -1104,8 +1110,11 @@ function beginRightDrag(sourceNode){
 function endRightDrag(){
   if (!dragOverlay) return;
   document.removeEventListener('mousemove', dragOverlay.onMouseMove);
+  const toRemove = dragOverlay.blockCtx;
   try { dragOverlay.svg.remove(); } catch {}
   dragOverlay = null;
+  // Defer unblocking context menu to swallow the post-mouseup browser event
+  setTimeout(() => { try { document.removeEventListener('contextmenu', toRemove, true); } catch {} }, 200);
 }
 
 // ---- Library ----
