@@ -316,12 +316,15 @@ def index() -> Response:
   <div class="app">
     <header>
       <strong>SequenceConfig Graph</strong>
+      <button id="openConfigBtn" class="pill">Open Config…</button>
+      <input id="hiddenConfigFile" type="file" accept=".yml,.yaml" style="display:none;" />
       <span class="pill">Config: <code id="cfgName"></code></span>
       <label class="pill">Sequence:
         <select id="sequenceSelect" style="margin-left: 6px; border: none; background: #fff; outline: none;">
         </select>
       </label>
       <button id="refreshBtn" class="pill primary">Refresh</button>
+      <button id="saveAsConfigBtn" class="pill">Save As…</button>
       <span id="status" class="muted"></span>
     </header>
     <div id="cy"></div>
@@ -351,6 +354,7 @@ def index() -> Response:
       <div class="muted" id="nodeMeta"></div>
       <div class="grid" id="formGrid"></div>
       <div class="row">
+        <button id="deleteBtn" class="pill danger">Delete</button>
         <button id="outputsBtn" class="pill">Outputs</button>
         <button id="closeBtn" class="pill">Close</button>
         <button id="saveBtn" class="pill primary">Save</button>
@@ -388,11 +392,15 @@ const cfgNameEl = document.getElementById('cfgName');
 const seqSelect = document.getElementById('sequenceSelect');
 const refreshBtn = document.getElementById('refreshBtn');
 const statusEl = document.getElementById('status');
+const saveAsConfigBtn = document.getElementById('saveAsConfigBtn');
+const openConfigBtn = document.getElementById('openConfigBtn');
+const hiddenConfigFile = document.getElementById('hiddenConfigFile');
 
 const modalBackdrop = document.getElementById('modalBackdrop');
 const modalTitle = document.getElementById('modalTitle');
 const nodeMeta = document.getElementById('nodeMeta');
 const formGrid = document.getElementById('formGrid');
+const deleteBtn = document.getElementById('deleteBtn');
 const closeBtn = document.getElementById('closeBtn');
 const saveBtn = document.getElementById('saveBtn');
 const outputsBtn = document.getElementById('outputsBtn');
@@ -432,6 +440,8 @@ async function loadSequences() {
   if (!res.ok) throw new Error('Failed to load sequences');
   const payload = await res.json();
   cfgNameEl.textContent = payload.config_path;
+  // populate configSelect if available
+  // removed dropdown population in favor of Open Config flow
   seqSelect.innerHTML = '';
   payload.sequences.forEach((s, idx) => {
     const opt = document.createElement('option');
@@ -535,13 +545,13 @@ async function loadGraph() {
     cy.add(elements);
     // fallback layout to prevent invisible graph if indices missing
     try {
-      cy.layout({
-        name: 'preset',
-        positions: function(node){
-          const idx = node.data('index') ?? 0;
-          return { x: 0, y: idx * verticalSpacing };
-        }
-      }).run();
+    cy.layout({
+      name: 'preset',
+      positions: function(node){
+        const idx = node.data('index') ?? 0;
+        return { x: 0, y: idx * verticalSpacing };
+      }
+    }).run();
     } catch (e) {
       cy.layout({ name: 'grid', rows: Math.ceil(Math.sqrt(g.nodes.length || 1)) }).run();
     }
@@ -678,10 +688,86 @@ async function saveEdits() {
   await loadGraph(); // refresh with updated YAML
 }
 
+async function deleteCurrentNode() {
+  if (!currentNode) return;
+  // If staged node (unsaved), just remove the staged item
+  const isStaged = !!currentNode.data('staged');
+  if (isStaged) {
+    const sid = currentNode.id();
+    stagedAdds = stagedAdds.filter(a => a.staged_id !== sid);
+    // remove any staged links targeting this staged node (future-proof)
+    stagedLinks = stagedLinks.filter(l => l.target_staged_id !== sid);
+    try { currentNode.remove(); } catch {}
+    closeModal();
+    renderStagedAdds();
+    updateSaveBarVisibility();
+    return;
+  }
+
+  // Existing node: confirm and call backend
+  const idx = currentNode.data('index');
+  if (idx == null) return;
+  if (!confirm('Delete this node from the configuration?')) return;
+  statusEl.textContent = 'Deleting...';
+  const res = await fetch('/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sequence_id: currentSeqId, node_index: idx })
+  });
+  if (!res.ok) {
+    statusEl.textContent = 'Delete failed';
+    try { alert('Delete failed: ' + await res.text()); } catch {}
+    return;
+  }
+  statusEl.textContent = 'Deleted';
+  closeModal();
+  // Clear any staged links targeting this index
+  stagedLinks = stagedLinks.filter(l => l.target_index !== idx);
+  await loadGraph();
+}
+
+async function saveAsConfig(){
+  const name = prompt('Save config as (relative path or filename, e.g., configs/new.yml):');
+  if (!name) return;
+  statusEl.textContent = 'Saving as...';
+  const res = await fetch('/save_as', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: name })
+  });
+  if (!res.ok) {
+    statusEl.textContent = 'Save As failed';
+    try { alert('Save As failed: ' + await res.text()); } catch {}
+    return;
+  }
+  const payload = await res.json();
+  statusEl.textContent = 'Saved as ' + payload.path;
+}
+
+async function uploadAndLoadConfig(){
+  if (!hiddenConfigFile.files || !hiddenConfigFile.files[0]) return;
+  const file = hiddenConfigFile.files[0];
+  const form = new FormData();
+  form.append('file', file, file.name);
+  statusEl.textContent = 'Uploading config...';
+  const res = await fetch('/upload_config', { method: 'POST', body: form });
+  if (!res.ok) {
+    statusEl.textContent = 'Upload failed';
+    try { alert('Upload failed: ' + await res.text()); } catch {}
+    return;
+  }
+  const payload = await res.json();
+  statusEl.textContent = 'Loaded ' + (payload.config_path || '');
+  await loadSequences();
+  await loadGraph();
+}
+
 refreshBtn.addEventListener('click', loadGraph);
 closeBtn.addEventListener('click', closeModal);
 saveBtn.addEventListener('click', saveEdits);
+deleteBtn.addEventListener('click', deleteCurrentNode);
 seqSelect.addEventListener('change', () => { clearStagedLinks(); loadGraph(); });
+saveAsConfigBtn.addEventListener('click', saveAsConfig);
+openConfigBtn.addEventListener('click', () => hiddenConfigFile.click());
+hiddenConfigFile.addEventListener('change', uploadAndLoadConfig);
 
 // ---- Drag & Drop helpers ----
 function renderOutputsPanel() {
@@ -744,29 +830,36 @@ function getDnDData(e){
   try { return JSON.parse(e.dataTransfer.getData('application/json')); } catch { return null; }
 }
 
-// ---- Class color mapping (unique per class) ----
-function buildUniqueClassPalette(){
-  if (!cy) return {};
-  const classes = [];
-  cy.nodes().forEach(n => { const c = n.data('cls'); if (c) classes.push(c); });
-  const uniq = Array.from(new Set(classes));
-  const palette = {};
-  // Golden-angle hue stepping for well-distributed unique hues
-  for (let i = 0; i < uniq.length; i++) {
-    const hue = (i * 137.508) % 360; // keep decimal to avoid collisions
-    // Vary saturation/lightness a bit over cycles to keep contrast with many classes
-    const sat = 65 + ((i % 3) * 7); // 65,72,79
-    const light = 35 + (Math.floor(i / 3) % 2) * 8; // 35,43,35,43...
-    palette[uniq[i]] = `hsl(${hue}, ${sat}%, ${light}%)`;
+// ---- Class color mapping (stable per class) ----
+let classColorMap = {};
+function computeColorByIndex(i){
+  const hue = (i * 137.508) % 360;
+  const sat = 65 + ((i % 3) * 7);
+  const light = 35 + (Math.floor(i / 3) % 2) * 8;
+  return `hsl(${hue}, ${sat}%, ${light}%)`;
+}
+function ensureClassColorFor(cls){
+  if (!cls) return;
+  if (!Object.prototype.hasOwnProperty.call(classColorMap, cls)) {
+    const idx = Object.keys(classColorMap).length;
+    classColorMap[cls] = computeColorByIndex(idx);
   }
-  return palette;
+}
+function ensureClassColorsFromSources(){
+  // include classes from library
+  const libMap = (library && library.classToModules) ? library.classToModules : {};
+  Object.keys(libMap).forEach(c => ensureClassColorFor(c));
+  // include classes from current graph
+  if (cy) {
+    cy.nodes().forEach(n => { const c = n.data('cls'); if (c) ensureClassColorFor(c); });
+  }
 }
 function applyClassColors(){
   if (!cy) return;
-  const palette = buildUniqueClassPalette();
+  ensureClassColorsFromSources();
   cy.nodes().forEach(n => {
     const cls = n.data('cls');
-    const color = cls ? (palette[cls] || '#374151') : '#374151';
+    const color = cls ? (classColorMap[cls] || '#374151') : '#374151';
     n.data('cls_color', color);
   });
 }
@@ -884,7 +977,12 @@ function renderStagedAdds(){
     eles.forEach((n, idx) => {
       n.position({ x: 0, y: stagedAdds[idx].dropY });
     });
-    applyClassColors();
+    // set class color for these nodes too
+    ensureClassColorsFromSources();
+    eles.forEach(n => {
+      const cls = n.data('cls');
+      if (cls) n.data('cls_color', classColorMap[cls] || '#374151');
+    });
   }
 }
 
@@ -1327,6 +1425,54 @@ def get_library():
 
     return jsonify({"classes": classes, "dir": str(lib_dir.resolve())})
 
+@app.get("/configs")
+def list_configs():
+    """List YAML config files in current working directory recursively (one level)."""
+    root = Path.cwd()
+    files: List[str] = []
+    for p in sorted(list(root.glob("*.yml")) + list(root.glob("*.yaml"))):
+        if p.is_file():
+            files.append(str(p.resolve()))
+    return jsonify({"files": files})
+
+@app.post("/load_config")
+def load_config():
+    data = request.get_json(force=True)
+    path = data.get("path")
+    if not path:
+        return Response("path is required", status=400)
+    global CONFIG_PATH
+    CONFIG_PATH = path
+    # Validate load
+    try:
+        _ = load_all_docs(CONFIG_PATH)
+    except Exception as e:
+        return Response(str(e), status=400)
+    return jsonify({"ok": True, "config_path": str(Path(CONFIG_PATH).resolve())})
+
+@app.post("/upload_config")
+def upload_config():
+    """
+    Accept a YAML file upload, save it under ./uploaded_configs/<filename>, set as active config, and validate.
+    """
+    if 'file' not in request.files:
+        return Response("file is required", status=400)
+    f = request.files['file']
+    if not f.filename:
+        return Response("filename is required", status=400)
+    out_dir = Path.cwd() / 'uploaded_configs'
+    out_dir.mkdir(parents=True, exist_ok=True)
+    target = out_dir / f.filename
+    f.save(str(target))
+    # switch active config
+    global CONFIG_PATH
+    CONFIG_PATH = str(target)
+    try:
+        _ = load_all_docs(CONFIG_PATH)
+    except Exception as e:
+        return Response(str(e), status=400)
+    return jsonify({"ok": True, "config_path": str(target.resolve())})
+
 @app.get("/graph")
 def graph():
     seq_id = request.args.get("sequence", default=None, type=str)
@@ -1398,6 +1544,63 @@ def update_node():
     save_all_docs(CONFIG_PATH, docs)
 
     return jsonify({"ok": True, "node_index": node_index})
+
+@app.post("/delete")
+def delete_node():
+    data = request.get_json(force=True)
+    seq_id = data.get("sequence_id")
+    node_index = data.get("node_index")
+    if node_index is None:
+        return Response("node_index is required", status=400)
+
+    docs = load_all_docs(CONFIG_PATH)
+    seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
+    seqs = get_sequences(seq_doc)
+
+    # choose sequence
+    sequence = None
+    sequence_idx = 0
+    if seq_id is not None:
+        for i, s in enumerate(seqs):
+            if str(s.get("id")) == str(seq_id):
+                sequence = s
+                sequence_idx = i
+                break
+    if sequence is None:
+        sequence = seqs[0]
+        sequence_idx = 0
+
+    modules = sequence.get("module_sequence", [])
+    ni = int(node_index)
+    if not (0 <= ni < len(modules)):
+        return Response("node_index out of range", status=400)
+
+    # remove the node
+    del modules[ni]
+    docs[seq_doc_idx]["sequences"][sequence_idx]["module_sequence"] = modules
+    save_all_docs(CONFIG_PATH, docs)
+
+    return jsonify({"ok": True})
+
+@app.post("/save_as")
+def save_as():
+    data = request.get_json(force=True)
+    rel_path = data.get("path")
+    if not rel_path or not isinstance(rel_path, str):
+        return Response("path is required", status=400)
+    # sanitize and ensure within workspace
+    target = Path(rel_path)
+    if not target.is_absolute():
+        target = Path.cwd() / target
+    # Load current docs and write to new path
+    docs = load_all_docs(CONFIG_PATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8") as f:
+            yaml.dump_all(docs, f)
+    except Exception as e:
+        return Response(str(e), status=500)
+    return jsonify({"ok": True, "path": str(target.resolve())})
 
 @app.post("/add_nodes")
 def add_nodes():
