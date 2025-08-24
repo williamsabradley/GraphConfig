@@ -856,6 +856,22 @@ function addStagedNodeAt(payload, dropY){
   updateSaveBarVisibility();
 }
 
+// Compute insertion indices for staged nodes based on vertical order
+function computeInsertionPlan(){
+  const existingCount = cy ? cy.nodes('[!staged]').length : 0;
+  const sortedAdds = stagedAdds.slice().sort((a,b) => a.dropY - b.dropY);
+  const inserts = [];
+  let currentLen = existingCount;
+  sortedAdds.forEach((a) => {
+    let idx = Math.round(a.dropY / VERTICAL_SPACING);
+    if (idx < 0) idx = 0;
+    if (idx > currentLen) idx = currentLen;
+    inserts.push({ staged_id: a.staged_id, index: idx, node: Object.assign({ module: a.full }, a.params || {}) });
+    currentLen += 1;
+  });
+  return { inserts };
+}
+
 function updateSaveBarVisibility(){
   const total = stagedLinks.length + stagedAdds.length;
   if (total > 0) {
@@ -1092,6 +1108,15 @@ function renderLibraryModules(){
     card.className = 'lib-card';
     const title = document.createElement('h4'); title.textContent = m.func; card.appendChild(title);
     const info = document.createElement('div'); info.className = 'muted'; info.textContent = m.full; card.appendChild(info);
+    const outsWrap = document.createElement('div');
+    outsWrap.style.display = 'flex'; outsWrap.style.flexWrap = 'wrap'; outsWrap.style.gap = '6px'; outsWrap.style.marginTop = '6px';
+    const outs = Array.isArray(m.outputs) ? m.outputs : [];
+    if (outs.length) {
+      outs.forEach(o => { const chip = document.createElement('span'); chip.className = 'pill'; chip.textContent = o; outsWrap.appendChild(chip); });
+    } else {
+      const none = document.createElement('span'); none.className = 'muted'; none.textContent = 'No outputs detected'; outsWrap.appendChild(none);
+    }
+    card.appendChild(outsWrap);
     const btns = document.createElement('div'); btns.style.display = 'flex'; btns.style.gap = '6px'; btns.style.marginTop = '6px';
     const viewBtn = document.createElement('button'); viewBtn.className = 'pill'; viewBtn.textContent = 'View';
     viewBtn.addEventListener('click', () => showLibraryDetails(cls, m));
@@ -1113,6 +1138,15 @@ function showLibraryDetails(cls, m){
   modalTitle.textContent = `Template: ${m.func} [${cls}]`;
   nodeMeta.innerHTML = `<span class="muted">module: <code>${escapeHtml(m.full)}</code></span>`;
   formGrid.innerHTML = '';
+  // Outputs section
+  const outputsSection = document.createElement('div'); outputsSection.className = 'field';
+  const outputsLabel = document.createElement('label'); outputsLabel.textContent = 'Outputs'; outputsSection.appendChild(outputsLabel);
+  const outputsBox = document.createElement('div'); outputsBox.style.display = 'flex'; outputsBox.style.flexWrap = 'wrap'; outputsBox.style.gap = '6px';
+  const outs = Array.isArray(m.outputs) ? m.outputs : [];
+  if (outs.length) { outs.forEach(o => { const chip = document.createElement('span'); chip.className = 'pill'; chip.textContent = o; outputsBox.appendChild(chip); }); }
+  else { const none = document.createElement('span'); none.className = 'muted'; none.textContent = 'No outputs detected'; outputsBox.appendChild(none); }
+  outputsSection.appendChild(outputsBox);
+  formGrid.appendChild(outputsSection);
   const params = m.params || {};
   Object.keys(params).forEach((key) => {
     const v = params[key];
