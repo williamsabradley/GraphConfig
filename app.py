@@ -387,11 +387,13 @@ def index() -> Response:
     <header>
       <strong>SequenceConfig Graph</strong>
       <span class="pill">Config: <code id="cfgName"></code></span>
-      <label class="pill">Sequence:
-        <select id="sequenceSelect" style="margin-left: 6px; border: none; background: #fff; outline: none;">
-        </select>
+      <label class="pill" style="display:flex; align-items:center; gap:6px;">Sequence:
+        <select id="sequenceSelect" style="margin-left: 6px; border: none; background: #fff; outline: none;"></select>
+        <button id="deleteSeqBtn" class="pill danger" title="Delete current sequence" style="padding:2px 8px;">×</button>
       </label>
       <button id="refreshBtn" class="pill primary">Refresh</button>
+      <button id="newSeqBtn" class="pill">New Blank</button>
+      <button id="copySeqBtn" class="pill">Copy Current</button>
       <button id="openBtn" class="pill">Open…</button>
       <button id="saveAsBtn" class="pill">Save As…</button>
       <span id="status" class="muted"></span>
@@ -461,9 +463,12 @@ def index() -> Response:
 <script>
 const cfgNameEl = document.getElementById('cfgName');
 const seqSelect = document.getElementById('sequenceSelect');
+const deleteSeqBtn = document.getElementById('deleteSeqBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 const openBtn = document.getElementById('openBtn');
 const saveAsBtn = document.getElementById('saveAsBtn');
+const newSeqBtn = document.getElementById('newSeqBtn');
+const copySeqBtn = document.getElementById('copySeqBtn');
 const statusEl = document.getElementById('status');
 
 const modalBackdrop = document.getElementById('modalBackdrop');
@@ -517,7 +522,7 @@ async function loadSequences() {
     const opt = document.createElement('option');
     opt.value = s.id;
     opt.textContent = `${s.id} — ${s.name ?? 'Sequence ' + s.id}`;
-    if (idx === 0) currentSeqId = s.id;
+    if (currentSeqId == null && idx === 0) currentSeqId = s.id;
     seqSelect.appendChild(opt);
   });
   if (payload.sequences.length > 0) {
@@ -546,6 +551,33 @@ async function saveAsConfig(){
     await loadSequences();
     await loadGraph();
   } catch (e) { alert('Save As failed: ' + e); }
+}
+
+async function createSequence(kind){
+  try {
+    const body = { kind, source_id: seqSelect.value ? Number(seqSelect.value) : null };
+    const res = await fetch('/sequence/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!res.ok) { alert('Create sequence failed: ' + await res.text()); return; }
+    const payload = await res.json();
+    currentSeqId = payload.new_id;
+    await loadSequences();
+    await loadGraph();
+  } catch (e) { alert('Create sequence failed: ' + e); }
+}
+
+async function deleteCurrentSequence(){
+  try {
+    if (!seqSelect.value) return;
+    const id = Number(seqSelect.value);
+    const ok = confirm(`Delete sequence ${id}? This cannot be undone.`);
+    if (!ok) return;
+    const res = await fetch('/sequence/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+    if (!res.ok) { alert('Delete sequence failed: ' + await res.text()); return; }
+    const payload = await res.json();
+    currentSeqId = payload.next_selected_id;
+    await loadSequences();
+    await loadGraph();
+  } catch (e) { alert('Delete sequence failed: ' + e); }
 }
 
 async function loadGraph() {
@@ -803,12 +835,28 @@ async function deleteCurrentNode(){
 refreshBtn.addEventListener('click', loadGraph);
 openBtn.addEventListener('click', chooseFileAndSetConfig);
 saveAsBtn.addEventListener('click', saveAsConfig);
+newSeqBtn.addEventListener('click', () => createSequence('blank'));
+copySeqBtn.addEventListener('click', () => createSequence('copy'));
 closeBtn.addEventListener('click', closeModal);
 saveBtn.addEventListener('click', saveEdits);
 seqSelect.addEventListener('change', () => { clearStagedLinks(); loadGraph(); });
+seqSelect.addEventListener('dblclick', async () => {
+  try {
+    if (!seqSelect.value) return;
+    const id = Number(seqSelect.value);
+    const currentName = Array.from(seqSelect.options).find(o => Number(o.value) === id)?.textContent?.split(' — ')[1] || '';
+    const name = prompt('Rename sequence:', currentName);
+    if (!name) return;
+    const res = await fetch('/sequence/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, name }) });
+    if (!res.ok) { alert('Rename failed: ' + await res.text()); return; }
+    await loadSequences();
+    await loadGraph();
+  } catch (e) { alert('Rename failed: ' + e); }
+});
 if (saveBarSaveAsBtn) saveBarSaveAsBtn.addEventListener('click', saveAsConfig);
 if (saveAsBtnModal) saveAsBtnModal.addEventListener('click', saveAsConfig);
 if (deleteBtn) deleteBtn.addEventListener('click', deleteCurrentNode);
+deleteSeqBtn.addEventListener('click', deleteCurrentSequence);
 
 // ---- Drag & Drop helpers ----
 function renderOutputsPanel() {
@@ -1734,6 +1782,144 @@ def delete_nodes():
     save_all_docs(get_config_path(), docs)
 
     return jsonify({"ok": True, "remaining": len(modules)})
+
+@app.post("/sequence/create")
+def sequence_create():
+    """
+    Body: { kind: "blank" | "copy", source_id?: int, name?: str }
+    Creates a new sequence. For kind="copy", copies the module_sequence from source_id.
+    Assigns a new unique id (one plus max existing id) and uses optional name or a default.
+    Returns: { ok: True, new_id: int }
+    """
+    data = request.get_json(force=True) or {}
+    kind = (data.get("kind") or "blank").lower()
+    source_id = data.get("source_id")
+    custom_name = data.get("name")
+
+    docs = load_all_docs(get_config_path())
+    seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
+    seqs = get_sequences(seq_doc)
+
+    # Choose new id
+    existing_ids = []
+    for s in seqs:
+        try:
+            existing_ids.append(int(s.get("id", 0)))
+        except Exception:
+            continue
+    new_id = (max(existing_ids) + 1) if existing_ids else 0
+
+    new_seq: Dict[str, Any] = {"id": new_id, "name": custom_name or f"Sequence {new_id}", "interval": 0, "module_sequence": []}
+
+    if kind == "copy":
+        # Find source by id match
+        src = None
+        if source_id is not None:
+            for s in seqs:
+                if str(s.get("id")) == str(source_id):
+                    src = s
+                    break
+        if src is None and seqs:
+            src = seqs[0]
+        if src is None:
+            return Response("no source sequence to copy", status=400)
+        # Deep copy modules
+        try:
+            src_modules = src.get("module_sequence", [])
+            new_seq["module_sequence"] = json.loads(json.dumps(src_modules))
+        except Exception:
+            new_seq["module_sequence"] = []
+        # Copy name if no custom name provided
+        if not custom_name:
+            try:
+                src_name = src.get("name")
+                if isinstance(src_name, str) and src_name.strip():
+                    new_seq["name"] = src_name.strip()
+            except Exception:
+                pass
+
+    # Append and persist
+    docs[seq_doc_idx]["sequences"].append(new_seq)
+    save_all_docs(get_config_path(), docs)
+
+    return jsonify({"ok": True, "new_id": new_id})
+
+@app.post("/sequence/delete")
+def sequence_delete():
+    """
+    Body: { id: int }
+    Deletes the sequence with matching id. After deletion, renumber remaining sequences to be contiguous from 0
+    while preserving relative order by current id ascending. Returns id to select next.
+    """
+    data = request.get_json(force=True) or {}
+    try:
+        target_id = int(data.get("id"))
+    except Exception:
+        return Response("id is required", status=400)
+
+    docs = load_all_docs(get_config_path())
+    seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
+    seqs = get_sequences(seq_doc)
+
+    # Sort by id ascending to get stable order
+    try:
+        seqs_sorted = sorted(seqs, key=lambda s: int(s.get("id", 0)))
+    except Exception:
+        seqs_sorted = seqs
+
+    # Remove target
+    kept = [s for s in seqs_sorted if str(s.get("id")) != str(target_id)]
+    if len(kept) == len(seqs_sorted):
+        return Response("sequence id not found", status=404)
+
+    # Renumber contiguous from 0
+    for new_idx, s in enumerate(kept):
+        s["id"] = new_idx
+
+    # Persist
+    docs[seq_doc_idx]["sequences"] = kept
+    save_all_docs(get_config_path(), docs)
+
+    # Choose next selection: closest id <= removed, else last, else None
+    next_id = None
+    if kept:
+        # After renumbering, if removed id was within range, keep same index; else clamp to last
+        if 0 <= target_id < len(kept):
+            next_id = target_id
+        else:
+            next_id = len(kept) - 1
+
+    return jsonify({"ok": True, "next_selected_id": next_id})
+
+@app.post("/sequence/rename")
+def sequence_rename():
+    """
+    Body: { id: int, name: str }
+    Renames the sequence with the given id.
+    """
+    data = request.get_json(force=True) or {}
+    try:
+        seq_id = int(data.get("id"))
+    except Exception:
+        return Response("id is required", status=400)
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return Response("name is required", status=400)
+
+    docs = load_all_docs(get_config_path())
+    seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
+    seqs = get_sequences(seq_doc)
+    target = None
+    for s in seqs:
+        if str(s.get("id")) == str(seq_id):
+            target = s
+            break
+    if target is None:
+        return Response("sequence id not found", status=404)
+    target["name"] = name.strip()
+    docs[seq_doc_idx]["sequences"] = seqs
+    save_all_docs(get_config_path(), docs)
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     app.run(debug=True)
