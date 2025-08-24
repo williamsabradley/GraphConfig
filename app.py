@@ -412,7 +412,7 @@ def index() -> Response:
 
   <aside id="libPanel" class="lib-panel">
     <div class="lib-header">
-      <strong>Library</strong>
+      <strong id="libTitle">Library</strong>
       <select id="libClassSelect" style="flex:1;">
         <option value="">Select class…</option>
       </select>
@@ -474,6 +474,21 @@ def index() -> Response:
     </div>
   </div>
 
+  <div class="modal-backdrop" id="sectionChooserBackdrop" style="display:none;">
+    <div class="modal" style="max-width: 420px;">
+      <h2 style="margin-bottom:8px;">Choose Panel</h2>
+      <div class="row" style="justify-content:flex-start; gap:8px;">
+        <button id="chooseLibraryBtn" class="pill">Library</button>
+        <button id="choosePlantInfoBtn" class="pill">PlantInfo</button>
+        <button id="chooseProjectConfigBtn" class="pill">ProjectConfig</button>
+        <button id="chooseIOConfigBtn" class="pill">IOConfig</button>
+      </div>
+      <div class="row">
+        <button id="sectionChooserClose" class="pill">Close</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 const cfgNameEl = document.getElementById('cfgName');
 const seqSelect = document.getElementById('sequenceSelect');
@@ -514,6 +529,13 @@ const saveBarSaveAsBtn = document.getElementById('saveBarSaveAsBtn');
 const libPanel = document.getElementById('libPanel');
 const libClassSelect = document.getElementById('libClassSelect');
 const libBody = document.getElementById('libBody');
+const libTitle = document.getElementById('libTitle');
+const sectionChooserBackdrop = document.getElementById('sectionChooserBackdrop');
+const chooseLibraryBtn = document.getElementById('chooseLibraryBtn');
+const choosePlantInfoBtn = document.getElementById('choosePlantInfoBtn');
+const chooseProjectConfigBtn = document.getElementById('chooseProjectConfigBtn');
+const chooseIOConfigBtn = document.getElementById('chooseIOConfigBtn');
+const sectionChooserClose = document.getElementById('sectionChooserClose');
 
 let cy;
 let currentSeqId = null;
@@ -524,6 +546,7 @@ let stagedAdds = []; // { staged_id, full, cls, func, params, dropY, outputs }
 let stagedAddCounter = 0;
 const VERTICAL_SPACING = 140;
 let library = { classToModules: {} };
+let rightPanelMode = 'library'; // 'library' | 'PlantInfo' | 'ProjectConfig' | 'IOConfig'
 
 function escapeHtml(s) {
   return (s ?? '').toString()
@@ -1011,6 +1034,16 @@ if (typeof libClassSelect !== 'undefined' && libClassSelect) {
   libClassSelect.addEventListener('change', renderLibraryModules);
 }
 
+// Right-click on the title to open chooser; suppress browser menu
+if (libTitle) {
+  libTitle.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); sectionChooserBackdrop.style.display = 'flex'; });
+}
+if (sectionChooserClose) sectionChooserClose.addEventListener('click', () => { sectionChooserBackdrop.style.display = 'none'; });
+if (chooseLibraryBtn) chooseLibraryBtn.addEventListener('click', async () => { sectionChooserBackdrop.style.display = 'none'; await switchRightPanel('library'); });
+if (choosePlantInfoBtn) choosePlantInfoBtn.addEventListener('click', async () => { sectionChooserBackdrop.style.display = 'none'; await switchRightPanel('PlantInfo'); });
+if (chooseProjectConfigBtn) chooseProjectConfigBtn.addEventListener('click', async () => { sectionChooserBackdrop.style.display = 'none'; await switchRightPanel('ProjectConfig'); });
+if (chooseIOConfigBtn) chooseIOConfigBtn.addEventListener('click', async () => { sectionChooserBackdrop.style.display = 'none'; await switchRightPanel('IOConfig'); });
+
 // ---- Drop onto graph to choose mapping ----
 let pendingLink = null; // { source_index, source_func, output_name, target_index }
 function nodeAtRenderedPoint(rx, ry){
@@ -1439,6 +1472,81 @@ function renderLibraryModules(){
   });
 }
 
+async function fetchConfigSection(section){
+  try {
+    const res = await fetch(`/config_section?name=${encodeURIComponent(section)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
+}
+
+function renderSectionEditor(sectionName, data){
+  libBody.innerHTML = '';
+  const form = document.createElement('div');
+  form.className = 'grid';
+  const obj = data || {};
+  Object.keys(obj).forEach(k => {
+    const v = obj[k];
+    const wrap = document.createElement('div'); wrap.className = 'field';
+    const label = document.createElement('label'); label.textContent = k; wrap.appendChild(label);
+    if (typeof v === 'boolean') {
+      const input = document.createElement('input'); input.type = 'checkbox'; input.checked = !!v; input.dataset.key = k; input.dataset.type = 'bool'; wrap.appendChild(input);
+    } else if (typeof v === 'number') {
+      const input = document.createElement('input'); input.type = 'number'; input.step = 'any'; input.value = String(v); input.dataset.key = k; input.dataset.type = 'number'; wrap.appendChild(input);
+    } else if (Array.isArray(v) || isObject(v)) {
+      const ta = document.createElement('textarea'); ta.rows = 10; ta.value = JSON.stringify(v, null, 2); ta.dataset.key = k; ta.dataset.type = 'json'; wrap.appendChild(ta);
+    } else {
+      const input = document.createElement('input'); input.type = 'text'; input.value = (v ?? '').toString(); input.dataset.key = k; input.dataset.type = 'text'; wrap.appendChild(input);
+    }
+    form.appendChild(wrap);
+  });
+  const row = document.createElement('div'); row.className = 'row';
+  const save = document.createElement('button'); save.className = 'pill primary'; save.textContent = 'Save';
+  save.addEventListener('click', async () => {
+    const payload = {};
+    const inputs = Array.from(form.querySelectorAll('input, textarea'));
+    for (const el of inputs) {
+      const key = el.dataset.key;
+      const t = el.dataset.type;
+      if (!key) continue;
+      if (t === 'bool') {
+        payload[key] = el.checked;
+      } else if (t === 'number') {
+        const num = parseFloat(el.value);
+        payload[key] = Number.isFinite(num) ? num : el.value;
+      } else if (t === 'json') {
+        try {
+          payload[key] = JSON.parse(el.value);
+        } catch (e) {
+          alert(`Invalid JSON for ${key}`);
+          return;
+        }
+      } else {
+        payload[key] = el.value;
+      }
+    }
+    const res = await fetch('/config_section', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: sectionName, data: payload }) });
+    if (!res.ok) { alert('Save failed: ' + await res.text()); return; }
+    alert('Saved.');
+  });
+  row.appendChild(save);
+  libBody.appendChild(form);
+  libBody.appendChild(row);
+}
+
+async function switchRightPanel(mode){
+  rightPanelMode = mode;
+  libTitle.textContent = mode === 'library' ? 'Library' : mode;
+  if (mode === 'library') {
+    libClassSelect.style.display = '';
+    renderLibraryModules();
+  } else {
+    libClassSelect.style.display = 'none';
+    const data = await fetchConfigSection(mode);
+    renderSectionEditor(mode, data && data.data);
+  }
+}
+
 function showLibraryDetails(cls, m){
   if (!modalTitle) return;
   currentNode = null; currentNodeData = null;
@@ -1666,6 +1774,45 @@ def graph():
 
     g = build_graph_from_sequence(sequence)
     return jsonify(g)
+
+@app.get("/config_section")
+def get_config_section():
+    name = request.args.get("name", type=str)
+    if not name:
+        return Response("name is required", status=400)
+    docs = load_all_docs(get_config_path())
+    try:
+        _, section = find_doc_by_section(docs, name)
+    except Exception:
+        return jsonify({"data": {}})
+    # Expose all keys except 'section'
+    data = {k: v for k, v in section.items() if k != "section"}
+    return jsonify({"data": data})
+
+@app.post("/config_section")
+def set_config_section():
+    body = request.get_json(force=True) or {}
+    name = body.get("name")
+    data = body.get("data", {})
+    if not isinstance(name, str) or not name:
+        return Response("name is required", status=400)
+    if not isinstance(data, dict):
+        return Response("data must be an object", status=400)
+    docs = load_all_docs(get_config_path())
+    try:
+        idx, section = find_doc_by_section(docs, name)
+    except Exception:
+        # create a new section if missing
+        section = {"section": name}
+        docs.append(section)
+        idx = len(docs) - 1
+    # Replace all keys except 'section'
+    new_section = {"section": name}
+    for k, v in data.items():
+        new_section[k] = v
+    docs[idx] = new_section
+    save_all_docs(get_config_path(), docs)
+    return jsonify({"ok": True})
 
 @app.post("/update")
 def update_node():
