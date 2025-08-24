@@ -460,6 +460,20 @@ def index() -> Response:
     </div>
   </div>
 
+  <div class="modal-backdrop" id="bulkCreateBackdrop" style="display:none;">
+    <div class="modal" style="max-width: 420px;">
+      <h2 style="margin-bottom:8px;">Generate Sequences</h2>
+      <div class="field">
+        <label for="bulkCount">How many?</label>
+        <input id="bulkCount" type="number" min="1" step="1" value="1" />
+      </div>
+      <div class="row">
+        <button id="bulkCancel" class="pill">Cancel</button>
+        <button id="bulkGenerate" class="pill primary">Generate</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 const cfgNameEl = document.getElementById('cfgName');
 const seqSelect = document.getElementById('sequenceSelect');
@@ -483,6 +497,10 @@ const saveAsBtnModal = document.getElementById('saveAsBtnModal');
 const outputsPanel = document.getElementById('outputsPanel');
 const outputsList = document.getElementById('outputsList');
 const linkerBackdrop = document.getElementById('linkerBackdrop');
+const bulkCreateBackdrop = document.getElementById('bulkCreateBackdrop');
+const bulkCount = document.getElementById('bulkCount');
+const bulkCancel = document.getElementById('bulkCancel');
+const bulkGenerate = document.getElementById('bulkGenerate');
 const linkerMeta = document.getElementById('linkerMeta');
 const linkerSourceOutput = document.getElementById('linkerSourceOutput');
 const linkerTargetInput = document.getElementById('linkerTargetInput');
@@ -563,6 +581,33 @@ async function createSequence(kind){
     await loadSequences();
     await loadGraph();
   } catch (e) { alert('Create sequence failed: ' + e); }
+}
+
+async function createSequencesBulk(kind, count){
+  // Sequential calls for simplicity; could be batched server-side later
+  let lastId = null;
+  for (let i = 0; i < count; i++) {
+    const body = { kind, source_id: seqSelect.value ? Number(seqSelect.value) : null };
+    const res = await fetch('/sequence/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!res.ok) { alert('Create sequence failed: ' + await res.text()); return; }
+    const payload = await res.json();
+    lastId = payload.new_id;
+  }
+  if (lastId != null) {
+    currentSeqId = lastId;
+    await loadSequences();
+    await loadGraph();
+  }
+}
+
+function openBulkModal(kind){
+  bulkCreateBackdrop.dataset.kind = kind;
+  if (bulkCount) bulkCount.value = '1';
+  bulkCreateBackdrop.style.display = 'flex';
+}
+function closeBulkModal(){
+  bulkCreateBackdrop.style.display = 'none';
+  delete bulkCreateBackdrop.dataset.kind;
 }
 
 async function deleteCurrentSequence(){
@@ -837,6 +882,9 @@ openBtn.addEventListener('click', chooseFileAndSetConfig);
 saveAsBtn.addEventListener('click', saveAsConfig);
 newSeqBtn.addEventListener('click', () => createSequence('blank'));
 copySeqBtn.addEventListener('click', () => createSequence('copy'));
+// Right-click contextmenu suppression + bulk create
+newSeqBtn.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); openBulkModal('blank'); });
+copySeqBtn.addEventListener('contextmenu', (e) => { e.preventDefault(); e.stopPropagation(); openBulkModal('copy'); });
 closeBtn.addEventListener('click', closeModal);
 saveBtn.addEventListener('click', saveEdits);
 seqSelect.addEventListener('change', () => { clearStagedLinks(); loadGraph(); });
@@ -857,6 +905,14 @@ if (saveBarSaveAsBtn) saveBarSaveAsBtn.addEventListener('click', saveAsConfig);
 if (saveAsBtnModal) saveAsBtnModal.addEventListener('click', saveAsConfig);
 if (deleteBtn) deleteBtn.addEventListener('click', deleteCurrentNode);
 deleteSeqBtn.addEventListener('click', deleteCurrentSequence);
+if (bulkCancel) bulkCancel.addEventListener('click', closeBulkModal);
+if (bulkGenerate) bulkGenerate.addEventListener('click', async () => {
+  const kind = bulkCreateBackdrop.dataset.kind || 'blank';
+  const n = parseInt(bulkCount.value || '1', 10);
+  if (!Number.isFinite(n) || n <= 0) { alert('Enter a valid positive number'); return; }
+  closeBulkModal();
+  await createSequencesBulk(kind, n);
+});
 
 // ---- Drag & Drop helpers ----
 function renderOutputsPanel() {

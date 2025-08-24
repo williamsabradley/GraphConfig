@@ -277,3 +277,368 @@ sequences:
   # - module: 'cOPC_Client_TCP.Write_F_Values'
   #   ref_data_x: { 'module': 'Calculate_PSD','name': 'Percent_x_mm','order': 0 }
   # - module: 'cOPC_Client_TCP.Write_Watchdog'
+- id: 1
+  name: Rock IQ TEST
+  interval: 0
+  module_sequence:
+  - module: cCamera.Camera
+    name: Camera 0
+    opc_prefix: ''
+    ip_address: 192.168.0.2
+    url: rtsp://root:pass@moly@192.168.0.2/axis-media/media.amp
+    fps: 30
+    reconnect_interval: 60
+    save_interval: 1
+    im_width: 848
+    im_height: 640
+    simulation_path: ./VIQ_Platform/VIQ_Misc_Files/~Image_Examples/Set_2
+    simulate: true
+  - module: cBaseAlgorithms.Image_Resize
+    ref_im:
+      module: cv2.read_image
+      name: original_image
+      order: 0
+    x_size: 848
+    y_size: 640
+  - module: cAdvanced_Bradlytics.Load_CNN
+    model_checkpoint_path: ./VIQ_Platform/VIQ_Misc_Files/~Models/Instance_Segmentation_BASE_FIX_V2_resnet34.hdf5.enc
+    backbone: resnet34
+    GPU: true
+    GPU_Memory_MB: 400
+  - module: cAdvanced_Bradlytics.Get_Prediction
+    ref_im:
+      module: Image_Resize
+      name: imresize
+      order: 0
+    ref_im_raw:
+      module: Image_Resize
+      name: imresize
+      order: 0
+    shape:
+    - 640
+    - 640
+    fines: false
+  - module: cAdvanced_Bradlytics.Get_Fines
+    ref_im:
+      module: Get_Prediction
+      name: mask
+      order: 0
+    ref_mask:
+      module: Get_Prediction
+      name: instances
+      order: 0
+    filter_size: 11
+  - module: cAdvanced_Bradlytics.Generate_Masks
+    ref_im_raw:
+      module: Image_Resize
+      name: imresize
+      order: 0
+    ref_mask:
+      module: Get_Prediction
+      name: instances
+      order: 0
+    ref_fines:
+      module: Get_Fines
+      name: entropy_image
+      order: 0
+    max_area: 100000000
+    fines_display: true
+    image_background: true
+    outline: true
+    alpha: 0.5
+    alpha_fines: 0.2
+    display_entropy_min: 4
+    display_entropy_max: 8
+    pixelrock_size_Q1: 40
+    pixelrock_size_Q2: 65
+  - module: cAdvanced_Bradlytics.Get_PSD
+    ref_mask:
+      module: Get_Prediction
+      name: instances
+      order: 0
+    ref_entropy:
+      module: Get_Fines
+      name: entropy_image
+      order: 0
+    fines_range:
+    - 0.1
+    - 20
+    bins: 20
+    min_qrt: 0.05
+    pixel_ratio: 1.6
+    entropy_range:
+    - 4
+    - 8
+  - module: cAdvanced_PSD.init_Calculate_PSD
+    curves:
+      ROSIN:
+        active: true
+        fixed_least_squares: false
+        power: 1.0
+        p63_guess: 70.0
+        fines_offset: 0.0
+        opc_active: true
+        color: (255,255,255)
+      SCHUMANN:
+        active: false
+        fixed_least_squares: false
+        power: 0.1
+        p100_guess: 160
+        fines_offset: 0.0
+        opc_active: false
+        color: (255, 255 ,0)
+      GAUDIN:
+        active: false
+        fixed_least_squares: true
+        power: 1.3
+        p100_guess: 160
+        fines_offset: 0.16
+        opc_active: false
+        color: (255, 0 , 255)
+      LOGNORM:
+        active: false
+        fixed_least_squares: false
+        stddev: 0.8
+        p50_guess: 100
+        fines_offset: 0.0499
+        opc_active: false
+        color: (0,255, 255)
+      LOGISTIC:
+        active: false
+        fixed_least_squares: true
+        p50_guess: 50
+        power: 2.5
+        fines_offset: 0.04999
+        opc_active: false
+        color: (0, 0, 255)
+      MULTIMODAL_CSPLINE:
+        active: false
+        extrapolate: true
+        opc_active: false
+        color: (255,255,255)
+  - module: cAdvanced_PSD.Calculate_PSD
+    ref_data:
+      module: Get_PSD
+      name: PSD_Data
+      order: 0
+    sieve_bins:
+    - 0
+    - 3
+    - 5.6
+    - 8
+    - 11.2
+    - 16
+    - 22.4
+    - 31.5
+    - 44
+    - 63
+    - 75
+    - 90
+    - 119
+    - 154
+    - 219
+    - 250
+    - 375
+    - 400
+    - 450
+    bin_sieve_sizes:
+    - 0.075
+    - 0.106
+    - 0.15
+    - 0.212
+    - 0.3
+    - 0.425
+    - 0.6
+    - 0.85
+    - 1.18
+    - 2.3
+    - 4
+    - 5.6
+    - 8
+    - 11.2
+    - 16
+    - 22.4
+    - 31.5
+    - 44
+    - 63
+    - 75
+    - 90
+    - 119
+    - 154
+    - 219
+    - 250
+    - 300
+    top_size: 400
+    n_fines_removed: 0
+    sieve_size_active: true
+    data_used_for_psd: 0
+  - module: cAdvanced_PSD.PSD_Output
+    ref_im_raw:
+      module: cv2.read_image
+      name: original_image
+      order: 0
+    ref_im_del:
+      module: Generate_Masks
+      name: Final_Contour_Im
+      order: 0
+    ref_data_x:
+      module: Calculate_PSD
+      name: Percent_x_mm
+      order: 0
+    ref_data_y:
+      module: Calculate_PSD
+      name: Percent_y_mm
+      order: 0
+    ref_df:
+      module: Calculate_PSD
+      name: dataframe
+      order: 0
+    ref_sieve_sizes:
+      module: Calculate_PSD
+      name: seive_sizes
+      order: 0
+    ref_percentages:
+      module: Calculate_PSD
+      name: percentages
+      order: 0
+    packet: RockIQ
+    camera_id: 0
+    outputs:
+      output_template: cAdvanced_PSD.PSD_Output_Template
+  - module: cAdvanced_PSD.Reverse_PSD_Output
+    ref_im_raw:
+      module: cv2.read_image
+      name: original_image
+      order: 0
+    ref_im_del:
+      module: Generate_Masks
+      name: Final_Contour_Im
+      order: 0
+    ref_data_x:
+      module: Calculate_PSD
+      name: Percent_x_mm
+      order: 0
+    ref_data_y:
+      module: Calculate_PSD
+      name: Percent_y_mm
+      order: 0
+    ref_df:
+      module: Calculate_PSD
+      name: dataframe
+      order: 0
+    ref_sieve_sizes:
+      module: Calculate_PSD
+      name: seive_sizes
+      order: 0
+    ref_percentages:
+      module: Calculate_PSD
+      name: percentages
+      order: 0
+    packet: RockIQ
+    camera_id: 0
+    outputs:
+      bin_sieve_sizes_list:
+      - 0.075
+      - 0.106
+      - 0.15
+      - 0.212
+      - 0.3
+      - 0.425
+      - 0.6
+      - 0.85
+      - 1.18
+      - 2.3
+      - 4
+      - 5.6
+      - 8
+      - 11.2
+      - 16
+      - 22.4
+      - 31.5
+      - 44
+      - 63
+      - 75
+      - 90
+      - 119
+      - 154
+      - 219
+      - 250
+      - 300
+  - module: cSave_RockIQ_Data_Periodic.Save_Data_RockIQ_Periodic
+    ref_im_raw:
+      module: Image_Resize
+      name: imresize
+      order: 0
+    ref_im_del:
+      module: Generate_Masks
+      name: Final_Contour_Im
+      order: 0
+    ref_data_x:
+      module: Calculate_PSD
+      name: Percent_x_mm
+      order: 0
+    ref_data_y:
+      module: Calculate_PSD
+      name: Percent_y_mm
+      order: 0
+    ref_df:
+      module: Calculate_PSD
+      name: dataframe
+      order: 0
+    ref_sieve_sizes:
+      module: Calculate_PSD
+      name: seive_sizes
+      order: 0
+    ref_percentages:
+      module: Calculate_PSD
+      name: percentages
+      order: 0
+    packet: RockIQ
+    camera_id: 0
+    site: test_site
+    picformat: jpg
+    saving_on: true
+    module_init:
+      path: .\VIQ_Platform\VIQ_Misc_Files\~Data\Feeder 0
+      rotation: weekly
+      max_age_months: 6
+      checking_freq_days: 3
+      max_images_per_hour: 50
+      max_folder_size_gb: 1
+  - module: cAdvanced_Http_Client.Send_Data_RockIQ
+    ref_im_raw:
+      module: Image_Resize
+      name: imresize
+      order: 0
+    ref_im_del:
+      module: Generate_Masks
+      name: Final_Contour_Im
+      order: 0
+    ref_data_x:
+      module: Calculate_PSD
+      name: Percent_x_mm
+      order: 0
+    ref_data_y:
+      module: Calculate_PSD
+      name: Percent_y_mm
+      order: 0
+    ref_df:
+      module: Calculate_PSD
+      name: dataframe
+      order: 0
+    ref_sieve_sizes:
+      module: Calculate_PSD
+      name: seive_sizes
+      order: 0
+    ref_percentages:
+      module: Calculate_PSD
+      name: percentages
+      order: 0
+    packet: RockIQ
+    camera_id: 0
+    servers:
+    - url: http://127.0.0.1:5000
+      verify: false
+    site: test_site
+    timeout: 0.5
+    send_interval: 0
