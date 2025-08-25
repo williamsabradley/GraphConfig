@@ -547,6 +547,7 @@ let stagedAddCounter = 0;
 const VERTICAL_SPACING = 140;
 let library = { classToModules: {} };
 let rightPanelMode = 'library'; // 'library' | 'PlantInfo' | 'ProjectConfig' | 'IOConfig'
+let stagedReorder = null; // array of existing node indices in new order
 
 function escapeHtml(s) {
   return (s ?? '').toString()
@@ -731,6 +732,7 @@ async function loadGraph() {
     cy.on('tap', 'node', onNodeTap);
     setupCyDnD();
     setupRightDrag();
+    setupReorderDrag();
     applyClassColors();
     // build from server library first; fallback to CY
     await fetchLibrary();
@@ -924,7 +926,14 @@ seqSelect.addEventListener('dblclick', async () => {
     await loadGraph();
   } catch (e) { alert('Rename failed: ' + e); }
 });
-if (saveBarSaveAsBtn) saveBarSaveAsBtn.addEventListener('click', saveAsConfig);
+if (saveBarSaveAsBtn) saveBarSaveAsBtn.addEventListener('click', async () => {
+  const hasStaged = stagedLinks.length || stagedAdds.length || (stagedReorder && stagedReorder.length);
+  if (hasStaged) {
+    await applyStagedChanges({ thenSaveAs: true });
+  } else {
+    await saveAsConfig();
+  }
+});
 if (saveAsBtnModal) saveAsBtnModal.addEventListener('click', saveAsConfig);
 if (deleteBtn) deleteBtn.addEventListener('click', deleteCurrentNode);
 deleteSeqBtn.addEventListener('click', deleteCurrentSequence);
@@ -1155,34 +1164,95 @@ function renderStagedAdds(){
 function addStagedNodeAt(payload, dropY){
   const staged_id = `sn${++stagedAddCounter}`;
   const outs = (library.classToModules[payload.cls]?.find(m => m.func === payload.func)?.outputs) || [];
-  stagedAdds.push({ staged_id, full: payload.full, cls: payload.cls, func: payload.func, params: JSON.parse(JSON.stringify(payload.params || {})), dropY, outputs: outs });
+  const desiredIndex = computeDesiredInsertionIndex(dropY);
+  stagedAdds.push({ staged_id, full: payload.full, cls: payload.cls, func: payload.func, params: JSON.parse(JSON.stringify(payload.params || {})), dropY, outputs: outs, desiredIndex });
   renderStagedAdds();
   updateSaveBarVisibility();
 }
 
+function computeDesiredInsertionIndex(dropY){
+  if (!cy) return 0;
+  const existing = cy.nodes('[!staged]');
+  if (!existing || existing.length === 0) return 0;
+  // Count how many existing node centers are above the drop point
+  let count = 0;
+  existing.forEach(n => {
+    const rp = n.renderedPosition();
+    if (rp.y < dropY) count += 1;
+  });
+  // Clamp to [0, existing.length]
+  if (count < 0) count = 0;
+  if (count > existing.length) count = existing.length;
+  return count;
+}
+
 // Compute insertion indices for staged nodes based on vertical order
 function computeInsertionPlan(){
-  const existingCount = cy ? cy.nodes('[!staged]').length : 0;
-  const sortedAdds = stagedAdds.slice().sort((a,b) => a.dropY - b.dropY);
-  const inserts = [];
-  let currentLen = existingCount;
-  sortedAdds.forEach((a) => {
-    let idx = Math.round(a.dropY / VERTICAL_SPACING);
-    if (idx < 0) idx = 0;
-    if (idx > currentLen) idx = currentLen;
-    inserts.push({ staged_id: a.staged_id, index: idx, node: Object.assign({ module: a.full }, a.params || {}) });
-    currentLen += 1;
+  const sortedAdds = stagedAdds.slice().sort((a,b) => {
+    const ai = (typeof a.desiredIndex === 'number') ? a.desiredIndex : computeDesiredInsertionIndex(a.dropY);
+    const bi = (typeof b.desiredIndex === 'number') ? b.desiredIndex : computeDesiredInsertionIndex(b.dropY);
+    return ai - bi;
   });
+  const inserts = sortedAdds.map(a => ({
+    staged_id: a.staged_id,
+    index: (typeof a.desiredIndex === 'number') ? a.desiredIndex : computeDesiredInsertionIndex(a.dropY),
+    node: Object.assign({ module: a.full }, a.params || {})
+  }));
   return { inserts };
 }
 
+// ---- Reorder existing nodes by dragging ----
+function setupReorderDrag(){
+  if (!cy) return;
+  // When a node is released after drag, compute new order
+  cy.on('free', 'node', onNodeDragReleased);
+}
+
+function onNodeDragReleased(){
+  const order = computeCurrentOrderFromPositions();
+  const original = computeOriginalOrder();
+  if (!arraysEqual(order, original)) {
+    stagedReorder = order;
+  } else {
+    stagedReorder = null;
+  }
+  updateSaveBarVisibility();
+}
+
+function computeCurrentOrderFromPositions(){
+  if (!cy) return [];
+  const nodes = cy.nodes('[!staged]');
+  const list = [];
+  nodes.forEach(n => { list.push({ y: n.renderedPosition().y, idx: n.data('index')||0 }); });
+  list.sort((a,b) => a.y - b.y);
+  return list.map(e => e.idx);
+}
+
+function computeOriginalOrder(){
+  if (!cy) return [];
+  const nodes = cy.nodes('[!staged]');
+  const list = [];
+  nodes.forEach(n => { list.push({ idx: n.data('index')||0 }); });
+  list.sort((a,b) => (a.idx - b.idx));
+  return list.map(e => e.idx);
+}
+
+function arraysEqual(a,b){
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length !== b.length) return false;
+  for (let i=0;i<a.length;i++){ if (a[i] !== b[i]) return false; }
+  return true;
+}
+
 function updateSaveBarVisibility(){
-  const total = stagedLinks.length + stagedAdds.length;
+  const reorderCount = (stagedReorder && stagedReorder.length) ? 1 : 0;
+  const total = stagedLinks.length + stagedAdds.length + reorderCount;
   if (total > 0) {
     saveBar.style.display = 'flex';
     const parts = [];
     if (stagedLinks.length) parts.push(`${stagedLinks.length} connection${stagedLinks.length>1?'s':''}`);
     if (stagedAdds.length) parts.push(`${stagedAdds.length} node${stagedAdds.length>1?'s':''}`);
+    if (reorderCount) parts.push(`order change`);
     saveMsg.textContent = `You have pending: ${parts.join(', ')}.`;
   } else {
     saveBar.style.display = 'none';
@@ -1192,63 +1262,77 @@ function updateSaveBarVisibility(){
 discardStagedBtn.addEventListener('click', () => {
   stagedLinks = [];
   stagedAdds = [];
+  stagedReorder = null;
   renderStagedEdges();
   renderStagedAdds();
   updateSaveBarVisibility();
+  loadGraph();
 });
 
-applyStagedBtn.addEventListener('click', async () => {
-  if (!stagedLinks.length && !stagedAdds.length) return;
-  statusEl.textContent = 'Saving changes...';
-  // First, insert staged nodes by vertical order
-  let stagedIndexMap = {}; // staged_id -> new index
-  if (stagedAdds.length) {
-    const plan = computeInsertionPlan();
-    const res = await fetch('/add_nodes', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sequence_id: currentSeqId, inserts: plan.inserts })
-    });
-    if (!res.ok) {
-      statusEl.textContent = 'Save failed';
-      alert('Save failed (adding nodes): ' + await res.text());
-      return;
-    }
-    const mapping = await res.json();
-    stagedIndexMap = mapping.assigned_indices || {};
+async function applyStagedChanges({ thenSaveAs } = { thenSaveAs: false }){
+  if (!stagedLinks.length && !stagedAdds.length && !stagedReorder) {
+    if (thenSaveAs) await saveAsConfig();
+    return;
   }
-
-  // group updates by target (existing or newly inserted)
-  const groups = {};
-  stagedLinks.forEach(l => {
-    const keyIndex = (l.target_index != null) ? l.target_index : stagedIndexMap[l.target_staged_id];
-    if (keyIndex == null) return;
-    const key = String(keyIndex);
-    groups[key] = groups[key] || { node_index: keyIndex, updates: {} };
-    groups[key].updates[l.target_key] = { module: l.source_func, name: l.output_name, order: 0 };
-  });
-  const payloads = Object.values(groups);
+  statusEl.textContent = 'Saving changes...';
   try {
-    const results = await Promise.all(payloads.map(g => fetch('/update', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sequence_id: currentSeqId, node_index: g.node_index, updates: g.updates })
-    })));
-    const firstBad = results.find(r => !r.ok);
-    if (firstBad) {
-      const txt = await firstBad.text();
-      statusEl.textContent = 'Save failed';
-      alert('Save failed: ' + txt);
-      return;
+    // 1) Insert staged nodes first
+    let stagedIndexMap = {}; // staged_id -> new index
+    if (stagedAdds.length) {
+      const plan = computeInsertionPlan();
+      const res = await fetch('/add_nodes', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sequence_id: currentSeqId, inserts: plan.inserts })
+      });
+      if (!res.ok) throw new Error('adding nodes: ' + await res.text());
+      const mapping = await res.json();
+      stagedIndexMap = mapping.assigned_indices || {};
     }
+
+    // 2) Apply parameter link updates
+    if (stagedLinks.length) {
+      const groups = {};
+      stagedLinks.forEach(l => {
+        const keyIndex = (l.target_index != null) ? l.target_index : stagedIndexMap[l.target_staged_id];
+        if (keyIndex == null) return;
+        const key = String(keyIndex);
+        groups[key] = groups[key] || { node_index: keyIndex, updates: {} };
+        groups[key].updates[l.target_key] = { module: l.source_func, name: l.output_name, order: 0 };
+      });
+      const payloads = Object.values(groups);
+      if (payloads.length) {
+        const results = await Promise.all(payloads.map(g => fetch('/update', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sequence_id: currentSeqId, node_index: g.node_index, updates: g.updates })
+        })));
+        const firstBad = results.find(r => !r.ok);
+        if (firstBad) throw new Error(await firstBad.text());
+      }
+    }
+
+    // 3) Apply reorder if any
+    if (stagedReorder && stagedReorder.length) {
+      const res2 = await fetch('/reorder_nodes', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sequence_id: currentSeqId, new_order: stagedReorder })
+      });
+      if (!res2.ok) throw new Error('reordering: ' + await res2.text());
+    }
+
     statusEl.textContent = 'Saved';
     stagedLinks = [];
     stagedAdds = [];
+    stagedReorder = null;
     updateSaveBarVisibility();
     await loadGraph();
+    if (thenSaveAs) await saveAsConfig();
   } catch (e) {
     statusEl.textContent = 'Save failed';
     alert('Save failed: ' + e);
   }
-});
+}
+
+applyStagedBtn.addEventListener('click', async () => { await applyStagedChanges({ thenSaveAs: false }); });
 
 function clearStagedLinks(){
   stagedLinks = [];
@@ -1934,6 +2018,63 @@ def add_nodes():
     save_all_docs(get_config_path(), docs)
 
     return jsonify({"ok": True, "assigned_indices": assigned})
+
+@app.post("/reorder_nodes")
+def reorder_nodes():
+    """
+    Body: {
+      sequence_id: 0,
+      new_order: [indices...]
+    }
+    Reorders the current sequence's module_sequence to match new_order, where new_order
+    is a permutation of existing indices by original index order.
+    """
+    data = request.get_json(force=True)
+    seq_id = data.get("sequence_id")
+    new_order = data.get("new_order", [])
+    if not isinstance(new_order, list) or not all(isinstance(i, int) for i in new_order):
+        return Response("new_order must be a list of integers", status=400)
+
+    docs = load_all_docs(get_config_path())
+    seq_doc_idx, seq_doc = find_doc_by_section(docs, "SequenceConfig")
+    seqs = get_sequences(seq_doc)
+
+    # choose sequence
+    sequence = None
+    sequence_idx = 0
+    if seq_id is not None:
+        for i, s in enumerate(seqs):
+            if str(s.get("id")) == str(seq_id):
+                sequence = s
+                sequence_idx = i
+                break
+    if sequence is None:
+        sequence = seqs[0]
+        sequence_idx = 0
+
+    modules = sequence.get("module_sequence", [])
+    if not isinstance(modules, list):
+        return Response("module_sequence must be a list", status=400)
+
+    n = len(modules)
+    if len(new_order) != n:
+        return Response("new_order length mismatch", status=400)
+    try:
+        # Ensure permutation
+        if sorted(new_order) != list(range(n)):
+            return Response("new_order must be a permutation of current indices", status=400)
+    except Exception:
+        return Response("invalid new_order", status=400)
+
+    # Rebuild modules in new order
+    try:
+        reordered = [modules[i] for i in new_order]
+    except Exception:
+        return Response("index out of range in new_order", status=400)
+
+    docs[seq_doc_idx]["sequences"][sequence_idx]["module_sequence"] = reordered
+    save_all_docs(get_config_path(), docs)
+    return jsonify({"ok": True, "count": len(reordered)})
 
 @app.post("/delete_nodes")
 def delete_nodes():

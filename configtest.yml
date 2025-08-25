@@ -60,6 +60,50 @@ sequences:
     ref_im_raw: {'module': 'Image_Resize', 'name': 'imresize', 'order': 0}
     shape: [640, 640]
     fines: false
+  - module: cAdvanced_Http_Client.Send_Data_RockIQ
+    camera_id: 0
+    packet: RockIQ
+    ref_data_x:
+      module: Calculate_PSD
+      name: Percent_x_mm
+      order: 0
+    ref_data_y:
+      module: Calculate_PSD
+      name: Percent_y_mm
+      order: 0
+    ref_df:
+      module: Calculate_PSD
+      name: dataframe
+      order: 0
+    ref_im_del:
+      module: Generate_Masks
+      name: Final_Contour_Im
+      order: 0
+    ref_im_raw:
+      module: Image_Resize
+      name: imresize
+      order: 0
+    ref_percentages:
+      module: Calculate_PSD
+      name: percentages
+      order: 0
+    ref_sieve_sizes:
+      module: Calculate_PSD
+      name: seive_sizes
+      order: 0
+    send_interval: 0
+    servers:
+    - url: http://127.0.0.1:5000
+      verify: false
+    site: test_site
+    timeout: 0.5
+  - module: cAdvanced_Bradlytics.Get_Fines
+    ref_im: {'module': 'Get_Prediction', 'name': 'mask', 'order': 0}
+    ref_mask:
+      module: Get_Prediction
+      name: instances
+      order: 0
+    filter_size: 11
   - module: cAdvanced_Bradlytics.Generate_Masks
     ref_im_raw: {'module': 'Image_Resize', 'name': 'imresize', 'order': 0}
     ref_mask: {'module': 'Get_Prediction', 'name': 'instances', 'order': 0}
